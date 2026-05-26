@@ -217,7 +217,8 @@ read_write_test (int num_transfers,
         params["use_uring"] = "true";
         params["use_aio"] = "false";
     } else {
-        // Use the backend's compiled default queue. Some builds have POSIX AIO but not Linux AIO.
+        // Explicitly request AIO
+        params["use_aio"] = "true";
         params["use_uring"] = "false";
     }
 
@@ -233,7 +234,7 @@ read_write_test (int num_transfers,
     std::cout << absl::StrFormat ("- Total data: %.2f GB\n",
                                   (float (transfer_size) * num_transfers) / gb_size);
     std::cout << absl::StrFormat ("- Directory: %s\n", test_files_dir_path_abs_path);
-    std::cout << absl::StrFormat("- Backend: %s\n", use_uring ? "io_uring" : "default");
+    std::cout << absl::StrFormat ("- Backend: %s\n", use_uring ? "io_uring" : "AIO");
     std::cout << absl::StrFormat ("- Direct I/O: %s\n", use_direct_io ? "enabled" : "disabled");
     std::cout << std::endl;
     std::cout << line_str << std::endl;
@@ -497,7 +498,8 @@ test_posix_repost (std::string test_files_dir_path_abs_path, bool use_uring) {
         params["use_uring"] = "true";
         params["use_aio"] = "false";
     } else {
-        // Use the backend's compiled default queue. Some builds have POSIX AIO but not Linux AIO.
+        // Explicitly request AIO
+        params["use_aio"] = "true";
         params["use_uring"] = "false";
     }
 
