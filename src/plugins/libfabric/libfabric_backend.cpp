@@ -45,6 +45,7 @@ namespace {
 constexpr size_t NIXL_LIBFABRIC_DEFAULT_POST_THREADS = 0;
 constexpr size_t NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE = 1024;
 constexpr size_t NIXL_LIBFABRIC_POST_THREAD_HW_MULTIPLIER = 4;
+constexpr size_t NIXL_LIBFABRIC_WRITE_FI_MORE_BATCH_SIZE = 16;
 
 size_t
 getSizeParam(const nixl_b_params_t &params, const std::string &key, size_t default_value) {
@@ -281,16 +282,28 @@ nixlLibfabricCudaCtx::cudaUpdateCtxPtr(void *address, int expected_dev, bool &wa
 
     was_updated = false;
 
-    if (expected_dev == -1) return -1;
-    if (myDevId_ != -1 && expected_dev != myDevId_) return -1;
+    if (expected_dev == -1) {
+        return -1;
+    }
+    if (myDevId_ != -1 && expected_dev != myDevId_) {
+        return -1;
+    }
 
     ret = cudaQueryAddr(address, is_dev, dev, ctx, pci_bus_id);
-    if (ret) return ret;
-    if (!is_dev) return 0;
-    if (dev != expected_dev) return -1;
+    if (ret) {
+        return ret;
+    }
+    if (!is_dev) {
+        return 0;
+    }
+    if (dev != expected_dev) {
+        return -1;
+    }
 
     if (pthrCudaCtx_) {
-        if (pthrCudaCtx_ != ctx) return -1;
+        if (pthrCudaCtx_ != ctx) {
+            return -1;
+        }
         return 0;
     }
 
@@ -304,7 +317,9 @@ nixlLibfabricCudaCtx::cudaUpdateCtxPtr(void *address, int expected_dev, bool &wa
 int
 nixlLibfabricCudaCtx::cudaSetCtx() {
     CUresult result;
-    if (NULL == pthrCudaCtx_) return 0;
+    if (NULL == pthrCudaCtx_) {
+        return 0;
+    }
 
     result = cuCtxSetCurrent(pthrCudaCtx_);
     return (CUDA_SUCCESS == result);
@@ -1133,6 +1148,8 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
                                          nixlLibfabricBackendH *backend_handle,
                                          int start_idx,
                                          int end_idx,
+                                         int desc_count,
+                                         size_t xfer_base_offset,
                                          size_t &submitted_count) const {
     submitted_count = 0;
 
@@ -1204,7 +1221,10 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             [backend_handle]() {
                 backend_handle->increment_completed_requests();
             }, // Completion callback
-            desc_submitted_count);
+            desc_submitted_count,
+            desc_idx,
+            desc_count,
+            xfer_base_offset);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx
@@ -1305,6 +1325,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     }
 
     size_t total_submitted = 0;
+    // Reserve base_offset once per transfer so all descriptors see a stable rail assignment.
+    const size_t xfer_base_offset = rail_manager.reserveBaseOffset();
     const bool use_post_pool = post_thread_pool_ && post_thread_count_ > 0 && desc_count > 0 &&
         static_cast<size_t>(desc_count) >= post_split_batch_size_;
 
@@ -1317,13 +1339,20 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                                                    backend_handle,
                                                    0,
                                                    desc_count,
+                                                   desc_count,
+                                                   xfer_base_offset,
                                                    total_submitted);
         if (status != NIXL_SUCCESS) {
             return status;
         }
     } else {
-        const size_t num_chunks = std::min(post_thread_count_, static_cast<size_t>(desc_count));
-        const size_t chunk_size = (desc_count + num_chunks - 1) / num_chunks;
+        const size_t post_group_size =
+            op_type == nixlLibfabricReq::WRITE ? NIXL_LIBFABRIC_WRITE_FI_MORE_BATCH_SIZE : 1;
+        const size_t grouped_desc_count =
+            (static_cast<size_t>(desc_count) + post_group_size - 1) / post_group_size;
+        const size_t num_chunks = std::min(post_thread_count_, grouped_desc_count);
+        const size_t groups_per_chunk = (grouped_desc_count + num_chunks - 1) / num_chunks;
+        const size_t chunk_size = groups_per_chunk * post_group_size;
         std::atomic<size_t> parallel_total_submitted{0};
         std::atomic<int> first_status{static_cast<int>(NIXL_SUCCESS)};
         std::mutex done_mutex;
@@ -1353,6 +1382,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                                                      backend_handle,
                                                      start_idx,
                                                      end_idx,
+                                                     desc_count,
+                                                     xfer_base_offset,
                                                      chunk_submitted);
                     }
                     catch (const std::exception &e) {

@@ -307,6 +307,8 @@ private:
                         nixlLibfabricBackendH *backend_handle,
                         int start_idx,
                         int end_idx,
+                        int desc_count,
+                        size_t xfer_base_offset,
                         size_t &submitted_count) const;
 
 #ifdef HAVE_CUDA
