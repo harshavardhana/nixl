@@ -61,10 +61,10 @@ public:
     virtual ~RdmaMemoryProvider() = default;
 
     virtual RegisteredMemoryLease
-    acquireBuffer(const void *ptr, size_t size) const = 0;
+    acquireBuffer(const void *ptr, size_t size, RegisteredMemoryType memory_type) const = 0;
 
     virtual RegisteredMemoryFragments
-    acquireBuffers(const void *ptr, size_t size) const = 0;
+    acquireBuffers(const void *ptr, size_t size, RegisteredMemoryType memory_type) const = 0;
 
     virtual char *
     getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op) = 0;
@@ -131,11 +131,11 @@ public:
 
     /// Resolve and pin a complete transfer range to its registered descriptor.
     RegisteredMemoryLease
-    acquireBuffer(const void *ptr, size_t size) const override;
+    acquireBuffer(const void *ptr, size_t size, RegisteredMemoryType memory_type) const override;
 
     /// Resolve and pin a transfer, splitting it at descriptor boundaries.
     RegisteredMemoryFragments
-    acquireBuffers(const void *ptr, size_t size) const override;
+    acquireBuffers(const void *ptr, size_t size, RegisteredMemoryType memory_type) const override;
 
     /// True if the pointer is CUDA device (VRAM) memory (no HTTP fallback possible).
     bool
@@ -149,11 +149,21 @@ public:
 
 private:
     SharedCuObjClient();
+    bool
+    acquireDescriptor(uintptr_t descriptor_base, size_t registered_length);
+    bool
+    releaseDescriptor(uintptr_t descriptor_base);
+
     CUObjIOOps ops_{};
     std::unique_ptr<cuObjClient> client_;
     bool connected_ = false;
     std::mutex mutex_;
-    RegisteredMemoryManager registeredMemory_{CUOBJ_MAX_MEMORY_REG_SIZE - 1};
+    RegisteredMemoryManager registeredMemory_{
+        CUOBJ_MAX_MEMORY_REG_SIZE - 1,
+        [this](uintptr_t descriptor_base, size_t registered_length) {
+            return acquireDescriptor(descriptor_base, registered_length);
+        },
+        [this](uintptr_t descriptor_base) { return releaseDescriptor(descriptor_base); }};
 };
 
 
@@ -227,7 +237,8 @@ rdmaPutWithRetry(RdmaMemoryProvider &rdma,
                  RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
-                 size_t size);
+                 size_t size,
+                 RegisteredMemoryType memory_type);
 
 ssize_t
 rdmaGetWithRetry(RdmaMemoryProvider &rdma,
@@ -235,7 +246,8 @@ rdmaGetWithRetry(RdmaMemoryProvider &rdma,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size,
-                 size_t offset);
+                 size_t offset,
+                 RegisteredMemoryType memory_type);
 
 } // namespace nixl_obj_rdma
 

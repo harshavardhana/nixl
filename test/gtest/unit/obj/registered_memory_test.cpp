@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -32,97 +33,143 @@ constexpr uintptr_t kBase = 0x100000;
 
 TEST(RegisteredMemoryRegistryTest, ResolvesBaseInteriorAndFinalByte) {
     RegisteredMemoryRegistry registry;
-    ASSERT_EQ(registry.insert({kBase, 1024, RegisteredMemoryType::Dram}, 1),
+    ASSERT_EQ(registry.insert({kBase, 1024}, 1),
               RangeInsertResult::Inserted);
 
-    const auto at_base = registry.resolve(kBase, 32);
+    const auto at_base = registry.resolve(kBase, 32, RegisteredMemoryType::Dram);
     EXPECT_EQ(at_base.status, RangeResolveStatus::Resolved);
     EXPECT_EQ(at_base.descriptorBase, kBase);
     EXPECT_EQ(at_base.registrationOffset, 0u);
 
-    const auto interior = registry.resolve(kBase + 127, 64);
+    const auto interior = registry.resolve(kBase + 127, 64, RegisteredMemoryType::Dram);
     EXPECT_EQ(interior.status, RangeResolveStatus::Resolved);
     EXPECT_EQ(interior.descriptorBase, kBase);
     EXPECT_EQ(interior.registrationOffset, 127u);
     EXPECT_EQ(interior.registeredLength, 1024u);
-    EXPECT_EQ(interior.memoryType, RegisteredMemoryType::Dram);
 
-    const auto final_byte = registry.resolve(kBase + 1023, 1);
+    const auto final_byte = registry.resolve(kBase + 1023, 1, RegisteredMemoryType::Dram);
     EXPECT_EQ(final_byte.status, RangeResolveStatus::Resolved);
     EXPECT_EQ(final_byte.registrationOffset, 1023u);
 }
 
 TEST(RegisteredMemoryRegistryTest, RejectsUnregisteredAndPartiallyContainedRequests) {
     RegisteredMemoryRegistry registry;
-    ASSERT_EQ(registry.insert({kBase, 1024, RegisteredMemoryType::Dram}, 1),
+    ASSERT_EQ(registry.insert({kBase, 1024}, 1),
               RangeInsertResult::Inserted);
 
-    EXPECT_EQ(registry.resolve(kBase - 1, 1).status, RangeResolveStatus::NotFound);
-    EXPECT_EQ(registry.resolve(kBase + 1024, 1).status, RangeResolveStatus::NotFound);
-    EXPECT_EQ(registry.resolve(kBase - 1, 2).status, RangeResolveStatus::NotFound);
-    EXPECT_EQ(registry.resolve(kBase + 1023, 2).status, RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase - 1, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase + 1024, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase - 1, 2, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase + 1023, 2, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
 }
 
 TEST(RegisteredMemoryRegistryTest, ReportsRequestAcrossAdjacentRanges) {
     RegisteredMemoryRegistry registry;
-    ASSERT_EQ(registry.insert({kBase, 1024, RegisteredMemoryType::Dram}, 1),
+    ASSERT_EQ(registry.insert({kBase, 1024}, 1),
               RangeInsertResult::Inserted);
-    ASSERT_EQ(registry.insert({kBase + 1024, 512, RegisteredMemoryType::Dram}, 1),
+    ASSERT_EQ(registry.insert({kBase + 1024, 512}, 1),
               RangeInsertResult::Inserted);
 
-    EXPECT_EQ(registry.resolve(kBase + 1023, 2).status,
+    EXPECT_EQ(registry.resolve(kBase + 1023, 2, RegisteredMemoryType::Dram).status,
               RangeResolveStatus::CrossRegistration);
-    const auto second = registry.resolve(kBase + 1024, 1);
+    const auto second = registry.resolve(kBase + 1024, 1, RegisteredMemoryType::Dram);
     EXPECT_EQ(second.status, RangeResolveStatus::Resolved);
     EXPECT_EQ(second.descriptorBase, kBase + 1024);
 }
 
 TEST(RegisteredMemoryRegistryTest, DistinguishesGapFromCrossRegistration) {
     RegisteredMemoryRegistry registry;
-    ASSERT_EQ(registry.insert({kBase, 1024, RegisteredMemoryType::Dram}, 1),
+    ASSERT_EQ(registry.insert({kBase, 1024}, 1),
               RangeInsertResult::Inserted);
-    ASSERT_EQ(registry.insert({kBase + 1025, 512, RegisteredMemoryType::Dram}, 1),
+    ASSERT_EQ(registry.insert({kBase + 1025, 512}, 1),
               RangeInsertResult::Inserted);
 
-    EXPECT_EQ(registry.resolve(kBase + 1023, 3).status, RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase + 1023, 3, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
 }
 
 TEST(RegisteredMemoryRegistryTest, RejectsZeroLengthAndAddressOverflow) {
     RegisteredMemoryRegistry registry;
-    EXPECT_EQ(registry.insert({kBase, 0, RegisteredMemoryType::Dram}, 1),
+    EXPECT_EQ(registry.insert({kBase, 0}, 1),
               RangeInsertResult::InvalidRange);
-    EXPECT_EQ(registry.resolve(kBase, 0).status, RangeResolveStatus::ZeroLength);
+    EXPECT_EQ(registry.resolve(kBase, 0, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::ZeroLength);
 
     const uintptr_t max_address = std::numeric_limits<uintptr_t>::max();
-    EXPECT_EQ(registry.insert({max_address, 2, RegisteredMemoryType::Dram}, 1),
+    EXPECT_EQ(registry.insert({max_address, 2}, 1),
               RangeInsertResult::InvalidRange);
-    EXPECT_EQ(registry.resolve(max_address, 2).status, RangeResolveStatus::AddressOverflow);
+    EXPECT_EQ(registry.resolve(max_address, 2, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::AddressOverflow);
 
-    ASSERT_EQ(registry.insert({max_address, 1, RegisteredMemoryType::Dram}, 2),
+    ASSERT_EQ(registry.insert({max_address, 1}, 2),
               RangeInsertResult::Inserted);
-    EXPECT_EQ(registry.resolve(max_address, 1).status, RangeResolveStatus::Resolved);
+    EXPECT_EQ(registry.resolve(max_address, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::Resolved);
 }
 
 TEST(RegisteredMemoryRegistryTest, ReferenceCountsDuplicatesAndRejectsOverlaps) {
     RegisteredMemoryRegistry registry;
-    const RegisteredMemoryRange range{kBase, 1024, RegisteredMemoryType::Dram};
+    const RegisteredMemoryRange range{kBase, 1024};
     ASSERT_EQ(registry.insert(range, 11), RangeInsertResult::Inserted);
     EXPECT_EQ(registry.insert(range, 12), RangeInsertResult::Duplicate);
-    EXPECT_EQ(registry.resolve(kBase, 1).ownerCount, 2u);
+    EXPECT_EQ(registry.resolve(kBase, 1, RegisteredMemoryType::Dram).ownerCount, 2u);
 
-    EXPECT_EQ(registry.insert({kBase, 1024, RegisteredMemoryType::Vram}, 13),
+    EXPECT_EQ(registry.insert({kBase + 1, 1024}, 13),
               RangeInsertResult::Overlap);
-    EXPECT_EQ(registry.insert({kBase + 1, 1024, RegisteredMemoryType::Dram}, 13),
+    EXPECT_EQ(registry.insert({kBase - 1, 2}, 13),
               RangeInsertResult::Overlap);
-    EXPECT_EQ(registry.insert({kBase - 1, 2, RegisteredMemoryType::Dram}, 13),
-              RangeInsertResult::Overlap);
-    EXPECT_EQ(registry.insert({kBase + 1024, 1, RegisteredMemoryType::Dram}, 13),
+    EXPECT_EQ(registry.insert({kBase + 1024, 1}, 13),
               RangeInsertResult::Inserted);
 
     EXPECT_EQ(registry.remove(range, 11), RangeRemoveResult::Retained);
-    EXPECT_EQ(registry.resolve(kBase, 1).ownerCount, 1u);
+    EXPECT_EQ(registry.resolve(kBase, 1, RegisteredMemoryType::Dram).ownerCount, 1u);
     EXPECT_EQ(registry.remove(range, 12), RangeRemoveResult::Removed);
-    EXPECT_EQ(registry.resolve(kBase, 1).status, RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+}
+
+TEST(RegisteredMemoryRegistryTest, TracksDramAndVramAsIndependentAddressSpaces) {
+    RegisteredMemoryRegistry registry;
+    const RegisteredMemoryRange dram{kBase, 1024, RegisteredMemoryType::Dram};
+    const RegisteredMemoryRange vram{kBase, 1024, RegisteredMemoryType::Vram};
+
+    ASSERT_EQ(registry.insert(dram, 1), RangeInsertResult::Inserted);
+    ASSERT_EQ(registry.insert(vram, 2), RangeInsertResult::Inserted);
+    EXPECT_EQ(registry.size(), 2u);
+
+    const auto dram_resolution =
+        registry.resolve(kBase + 16, 32, RegisteredMemoryType::Dram);
+    const auto vram_resolution =
+        registry.resolve(kBase + 16, 32, RegisteredMemoryType::Vram);
+    ASSERT_EQ(dram_resolution.status, RangeResolveStatus::Resolved);
+    ASSERT_EQ(vram_resolution.status, RangeResolveStatus::Resolved);
+    EXPECT_EQ(dram_resolution.memoryType, RegisteredMemoryType::Dram);
+    EXPECT_EQ(vram_resolution.memoryType, RegisteredMemoryType::Vram);
+
+    EXPECT_EQ(registry.remove(dram, 1), RangeRemoveResult::Removed);
+    EXPECT_EQ(registry.resolve(kBase, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase, 1, RegisteredMemoryType::Vram).status,
+              RangeResolveStatus::Resolved);
+}
+
+TEST(RegisteredMemoryRegistryTest, DoesNotResolveOrJoinRangesAcrossMemoryTypes) {
+    RegisteredMemoryRegistry registry;
+    ASSERT_EQ(registry.insert({kBase, 1024, RegisteredMemoryType::Dram}, 1),
+              RangeInsertResult::Inserted);
+    ASSERT_EQ(registry.insert({kBase + 1024, 1024, RegisteredMemoryType::Vram}, 2),
+              RangeInsertResult::Inserted);
+
+    EXPECT_EQ(registry.resolve(kBase, 1, RegisteredMemoryType::Vram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase + 1023, 2, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(registry.resolve(kBase + 1023, 2, RegisteredMemoryType::Vram).status,
+              RangeResolveStatus::NotFound);
 }
 
 class DescriptorMock {
@@ -138,6 +185,9 @@ public:
     release(uintptr_t base) {
         const std::lock_guard<std::mutex> lock(mutex);
         releases.push_back(base);
+        if (releaseObserver) {
+            releaseObserver(base);
+        }
         return failRelease == 0 || releases.size() != failRelease;
     }
 
@@ -153,6 +203,7 @@ public:
 
     size_t failAcquisition = 0;
     size_t failRelease = 0;
+    std::function<void(uintptr_t)> releaseObserver;
     std::vector<std::pair<uintptr_t, size_t>> acquisitions;
     std::vector<uintptr_t> releases;
     std::mutex mutex;
@@ -163,16 +214,15 @@ constexpr size_t kCuObjMaxMemoryRegistrationSize = 4ULL * 1024 * 1024 * 1024;
 TEST(RegisteredMemoryManagerTest, KeepsRegistrationsAtOrBelowLimitInOneChunk) {
     for (const size_t length :
          {kCuObjMaxMemoryRegistrationSize - 1, kCuObjMaxMemoryRegistrationSize}) {
-        RegisteredMemoryManager manager(kCuObjMaxMemoryRegistrationSize);
         DescriptorMock mock;
+        RegisteredMemoryManager manager(kCuObjMaxMemoryRegistrationSize,
+                                        mock.acquireCallback(),
+                                        mock.releaseCallback());
         LogicalMemoryRegistration registration;
 
         ASSERT_TRUE(manager.registerMemory(kBase,
                                            length,
-                                           RegisteredMemoryType::Dram,
-                                           mock.acquireCallback(),
-                                           mock.releaseCallback(),
-                                           registration));
+                                           RegisteredMemoryType::Dram, registration));
         ASSERT_EQ(registration.chunks.size(), 1u);
         EXPECT_EQ(registration.chunks[0].length, length);
         ASSERT_EQ(mock.acquisitions.size(), 1u);
@@ -181,17 +231,16 @@ TEST(RegisteredMemoryManagerTest, KeepsRegistrationsAtOrBelowLimitInOneChunk) {
 }
 
 TEST(RegisteredMemoryManagerTest, SplitsMaximumPlusOneAndMultipleChunks) {
-    RegisteredMemoryManager manager(kCuObjMaxMemoryRegistrationSize);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(kCuObjMaxMemoryRegistrationSize,
+                                    mock.acquireCallback(),
+                                    mock.releaseCallback());
     LogicalMemoryRegistration registration;
     const size_t length = 2 * kCuObjMaxMemoryRegistrationSize + 17;
 
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        length,
-                                       RegisteredMemoryType::Vram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       registration));
+                                       RegisteredMemoryType::Dram, registration));
     ASSERT_EQ(registration.chunks.size(), 3u);
     EXPECT_EQ(registration.chunks[0].descriptorBase, kBase);
     EXPECT_EQ(registration.chunks[0].length, kCuObjMaxMemoryRegistrationSize);
@@ -201,23 +250,21 @@ TEST(RegisteredMemoryManagerTest, SplitsMaximumPlusOneAndMultipleChunks) {
     EXPECT_EQ(registration.chunks[2].descriptorBase,
               kBase + 2 * kCuObjMaxMemoryRegistrationSize);
     EXPECT_EQ(registration.chunks[2].length, 17u);
-    EXPECT_EQ(registration.chunks[2].memoryType, RegisteredMemoryType::Vram);
     for (const auto &acquisition : mock.acquisitions) {
         EXPECT_LE(acquisition.second, kCuObjMaxMemoryRegistrationSize);
     }
 }
 
 TEST(RegisteredMemoryManagerTest, MaximumPlusOneMakesTwoChunks) {
-    RegisteredMemoryManager manager(kCuObjMaxMemoryRegistrationSize);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(kCuObjMaxMemoryRegistrationSize,
+                                    mock.acquireCallback(),
+                                    mock.releaseCallback());
     LogicalMemoryRegistration registration;
 
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        kCuObjMaxMemoryRegistrationSize + 1,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       registration));
+                                       RegisteredMemoryType::Dram, registration));
     ASSERT_EQ(registration.chunks.size(), 2u);
     EXPECT_EQ(registration.chunks[0].length, kCuObjMaxMemoryRegistrationSize);
     EXPECT_EQ(registration.chunks[1].length, 1u);
@@ -225,122 +272,105 @@ TEST(RegisteredMemoryManagerTest, MaximumPlusOneMakesTwoChunks) {
 
 TEST(RegisteredMemoryManagerTest, RollsBackEveryAcquiredChunkOnFailure) {
     constexpr size_t kChunkSize = 1024;
-    RegisteredMemoryManager manager(kChunkSize);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(kChunkSize, mock.acquireCallback(), mock.releaseCallback());
     mock.failAcquisition = 3;
     LogicalMemoryRegistration registration;
 
     EXPECT_FALSE(manager.registerMemory(kBase,
                                         3 * kChunkSize,
-                                        RegisteredMemoryType::Dram,
-                                        mock.acquireCallback(),
-                                        mock.releaseCallback(),
-                                        registration));
+                                        RegisteredMemoryType::Dram, registration));
     EXPECT_FALSE(registration.valid());
     EXPECT_EQ(manager.rangeCount(), 0u);
     ASSERT_EQ(mock.releases.size(), 2u);
     EXPECT_EQ(mock.releases[0], kBase + kChunkSize);
     EXPECT_EQ(mock.releases[1], kBase);
-    EXPECT_EQ(manager.resolve(kBase, 1).status, RangeResolveStatus::NotFound);
+    EXPECT_EQ(manager.resolve(kBase, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
 }
 
 TEST(RegisteredMemoryManagerTest, DeregistrationReleasesAllAndOnlyOwnedChunks) {
     constexpr size_t kChunkSize = 1024;
-    RegisteredMemoryManager manager(kChunkSize);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(kChunkSize, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration registration;
 
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        2 * kChunkSize + 1,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       registration));
-    EXPECT_TRUE(manager.deregisterMemory(registration, mock.releaseCallback()));
+                                       RegisteredMemoryType::Dram, registration));
+    EXPECT_TRUE(manager.deregisterMemory(registration));
     EXPECT_FALSE(registration.valid());
     EXPECT_EQ(manager.rangeCount(), 0u);
     EXPECT_EQ(mock.releases,
               (std::vector<uintptr_t>{kBase, kBase + kChunkSize, kBase + 2 * kChunkSize}));
-    EXPECT_FALSE(manager.deregisterMemory(registration, mock.releaseCallback()));
+    EXPECT_FALSE(manager.deregisterMemory(registration));
     EXPECT_EQ(mock.releases.size(), 3u);
 }
 
 TEST(RegisteredMemoryManagerTest, ExactDuplicatesShareDescriptorsUntilLastOwnerLeaves) {
-    RegisteredMemoryManager manager(1024);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration first;
     LogicalMemoryRegistration second;
 
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        1024,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       first));
+                                       RegisteredMemoryType::Dram, first));
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        1024,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       second));
+                                       RegisteredMemoryType::Dram, second));
     EXPECT_EQ(mock.acquisitions.size(), 1u);
-    EXPECT_EQ(manager.resolve(kBase, 1).ownerCount, 2u);
+    EXPECT_EQ(manager.resolve(kBase, 1, RegisteredMemoryType::Dram).ownerCount, 2u);
 
-    EXPECT_TRUE(manager.deregisterMemory(first, mock.releaseCallback()));
+    EXPECT_TRUE(manager.deregisterMemory(first));
     EXPECT_TRUE(mock.releases.empty());
-    EXPECT_EQ(manager.resolve(kBase, 1).ownerCount, 1u);
-    EXPECT_TRUE(manager.deregisterMemory(second, mock.releaseCallback()));
+    EXPECT_EQ(manager.resolve(kBase, 1, RegisteredMemoryType::Dram).ownerCount, 1u);
+    EXPECT_TRUE(manager.deregisterMemory(second));
     EXPECT_EQ(mock.releases, (std::vector<uintptr_t>{kBase}));
 }
 
 TEST(RegisteredMemoryManagerTest, ReleaseFailureIsReportedWithoutRetry) {
-    RegisteredMemoryManager manager(1024);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration registration;
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        2048,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       registration));
+                                       RegisteredMemoryType::Dram, registration));
     mock.failRelease = 1;
 
-    EXPECT_FALSE(manager.deregisterMemory(registration, mock.releaseCallback()));
+    EXPECT_FALSE(manager.deregisterMemory(registration));
     EXPECT_FALSE(registration.valid());
     EXPECT_EQ(manager.rangeCount(), 0u);
     EXPECT_EQ(mock.releases.size(), 2u);
 }
 
 TEST(RegisteredMemoryManagerTest, DeregistrationWaitsForTransferLeaseWithoutHoldingRegistryLock) {
-    RegisteredMemoryManager manager(1024);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration registration;
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        1024,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       registration));
+                                       RegisteredMemoryType::Dram, registration));
 
-    auto lease = manager.resolveAndAcquire(kBase + 64, 128);
+    auto lease =
+        manager.resolveAndAcquire(kBase + 64, 128, RegisteredMemoryType::Dram);
     ASSERT_TRUE(lease.valid());
     EXPECT_EQ(lease.resolution().descriptorBase, kBase);
     EXPECT_EQ(lease.resolution().registrationOffset, 64u);
 
     std::atomic<bool> release_called{false};
-    auto deregistration = std::async(std::launch::async, [&]() {
-        return manager.deregisterMemory(registration, [&](uintptr_t base) {
-            release_called.store(true);
-            return mock.release(base);
-        });
-    });
+    mock.releaseObserver = [&](uintptr_t) { release_called.store(true); };
+    auto deregistration =
+        std::async(std::launch::async, [&]() { return manager.deregisterMemory(registration); });
 
     for (int attempt = 0; attempt < 100 &&
-                          manager.resolve(kBase, 1).status != RangeResolveStatus::NotFound;
+                          manager.resolve(kBase, 1, RegisteredMemoryType::Dram).status !=
+                              RangeResolveStatus::NotFound;
          ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_EQ(manager.resolve(kBase, 1).status, RangeResolveStatus::NotFound);
+    EXPECT_EQ(manager.resolve(kBase, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
     EXPECT_EQ(deregistration.wait_for(std::chrono::milliseconds(10)),
               std::future_status::timeout);
     EXPECT_FALSE(release_called.load());
@@ -350,32 +380,27 @@ TEST(RegisteredMemoryManagerTest, DeregistrationWaitsForTransferLeaseWithoutHold
     LogicalMemoryRegistration adjacent;
     EXPECT_TRUE(manager.registerMemory(kBase + 2048,
                                        64,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       adjacent));
+                                       RegisteredMemoryType::Dram, adjacent));
 
     lease.reset();
     EXPECT_TRUE(deregistration.get());
     EXPECT_TRUE(release_called.load());
-    EXPECT_TRUE(manager.deregisterMemory(adjacent, mock.releaseCallback()));
+    EXPECT_TRUE(manager.deregisterMemory(adjacent));
 }
 
 TEST(RegisteredMemoryManagerTest, ConcurrentLookupDuplicateAndAdjacentRegistrationAreSafe) {
-    RegisteredMemoryManager manager(1024);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration persistent;
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        1024,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       persistent));
+                                       RegisteredMemoryType::Dram, persistent));
 
     std::atomic<bool> failed{false};
     std::thread lookup_thread([&]() {
         for (int i = 0; i < 500; ++i) {
-            auto lease = manager.resolveAndAcquire(kBase + (i % 512), 1);
+            auto lease = manager.resolveAndAcquire(
+                kBase + (i % 512), 1, RegisteredMemoryType::Dram);
             if (!lease.valid() || lease.resolution().descriptorBase != kBase) {
                 failed.store(true);
             }
@@ -386,11 +411,8 @@ TEST(RegisteredMemoryManagerTest, ConcurrentLookupDuplicateAndAdjacentRegistrati
             LogicalMemoryRegistration duplicate;
             if (!manager.registerMemory(kBase,
                                         1024,
-                                        RegisteredMemoryType::Dram,
-                                        mock.acquireCallback(),
-                                        mock.releaseCallback(),
-                                        duplicate) ||
-                !manager.deregisterMemory(duplicate, mock.releaseCallback())) {
+                                        RegisteredMemoryType::Dram, duplicate) ||
+                !manager.deregisterMemory(duplicate)) {
                 failed.store(true);
             }
         }
@@ -400,11 +422,8 @@ TEST(RegisteredMemoryManagerTest, ConcurrentLookupDuplicateAndAdjacentRegistrati
             LogicalMemoryRegistration adjacent;
             if (!manager.registerMemory(kBase + 1024,
                                         1024,
-                                        RegisteredMemoryType::Dram,
-                                        mock.acquireCallback(),
-                                        mock.releaseCallback(),
-                                        adjacent) ||
-                !manager.deregisterMemory(adjacent, mock.releaseCallback())) {
+                                        RegisteredMemoryType::Dram, adjacent) ||
+                !manager.deregisterMemory(adjacent)) {
                 failed.store(true);
             }
         }
@@ -414,22 +433,20 @@ TEST(RegisteredMemoryManagerTest, ConcurrentLookupDuplicateAndAdjacentRegistrati
     duplicate_thread.join();
     adjacent_thread.join();
     EXPECT_FALSE(failed.load());
-    EXPECT_TRUE(manager.deregisterMemory(persistent, mock.releaseCallback()));
+    EXPECT_TRUE(manager.deregisterMemory(persistent));
     EXPECT_EQ(manager.rangeCount(), 0u);
 }
 
 TEST(RegisteredMemoryManagerTest, ResolvesAndPinsOrderedCrossDescriptorFragments) {
-    RegisteredMemoryManager manager(1024);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration registration;
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        3072,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       registration));
+                                       RegisteredMemoryType::Dram, registration));
 
-    auto fragments = manager.resolveAndAcquireFragments(kBase + 100, 2500);
+    auto fragments = manager.resolveAndAcquireFragments(
+        kBase + 100, 2500, RegisteredMemoryType::Dram);
     ASSERT_TRUE(fragments.valid());
     ASSERT_EQ(fragments.leases.size(), 3u);
     EXPECT_EQ(fragments.leases[0].resolution().descriptorBase, kBase);
@@ -438,9 +455,8 @@ TEST(RegisteredMemoryManagerTest, ResolvesAndPinsOrderedCrossDescriptorFragments
     EXPECT_EQ(fragments.leases[1].resolution().registrationOffset, 0u);
     EXPECT_EQ(fragments.leases[2].resolution().descriptorBase, kBase + 2048);
 
-    auto deregistration = std::async(std::launch::async, [&]() {
-        return manager.deregisterMemory(registration, mock.releaseCallback());
-    });
+    auto deregistration =
+        std::async(std::launch::async, [&]() { return manager.deregisterMemory(registration); });
     EXPECT_EQ(deregistration.wait_for(std::chrono::milliseconds(10)),
               std::future_status::timeout);
     fragments.leases.clear();
@@ -449,29 +465,58 @@ TEST(RegisteredMemoryManagerTest, ResolvesAndPinsOrderedCrossDescriptorFragments
 }
 
 TEST(RegisteredMemoryManagerTest, FragmentResolutionRejectsGapsWithoutRetainingLeases) {
-    RegisteredMemoryManager manager(1024);
     DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
     LogicalMemoryRegistration first;
     LogicalMemoryRegistration second;
     ASSERT_TRUE(manager.registerMemory(kBase,
                                        1024,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       first));
+                                       RegisteredMemoryType::Dram, first));
     ASSERT_TRUE(manager.registerMemory(kBase + 2048,
                                        1024,
-                                       RegisteredMemoryType::Dram,
-                                       mock.acquireCallback(),
-                                       mock.releaseCallback(),
-                                       second));
+                                       RegisteredMemoryType::Dram, second));
 
-    auto fragments = manager.resolveAndAcquireFragments(kBase + 512, 2048);
+    auto fragments = manager.resolveAndAcquireFragments(
+        kBase + 512, 2048, RegisteredMemoryType::Dram);
     EXPECT_FALSE(fragments.valid());
     EXPECT_EQ(fragments.status, RangeResolveStatus::NotFound);
     EXPECT_TRUE(fragments.leases.empty());
-    EXPECT_TRUE(manager.deregisterMemory(first, mock.releaseCallback()));
-    EXPECT_TRUE(manager.deregisterMemory(second, mock.releaseCallback()));
+    EXPECT_TRUE(manager.deregisterMemory(first));
+    EXPECT_TRUE(manager.deregisterMemory(second));
+}
+
+TEST(RegisteredMemoryManagerTest, SameNumericDramAndVramRangesHaveIndependentLifetimes) {
+    DescriptorMock mock;
+    RegisteredMemoryManager manager(1024, mock.acquireCallback(), mock.releaseCallback());
+    LogicalMemoryRegistration dram;
+    LogicalMemoryRegistration vram;
+
+    ASSERT_TRUE(
+        manager.registerMemory(kBase, 1024, RegisteredMemoryType::Dram, dram));
+    ASSERT_TRUE(
+        manager.registerMemory(kBase, 1024, RegisteredMemoryType::Vram, vram));
+    ASSERT_EQ(mock.acquisitions.size(), 2u);
+    EXPECT_EQ(manager.rangeCount(), 2u);
+
+    auto dram_lease = manager.resolveAndAcquire(kBase, 1, RegisteredMemoryType::Dram);
+    auto vram_lease = manager.resolveAndAcquire(kBase, 1, RegisteredMemoryType::Vram);
+    ASSERT_TRUE(dram_lease.valid());
+    ASSERT_TRUE(vram_lease.valid());
+    EXPECT_EQ(dram_lease.resolution().memoryType, RegisteredMemoryType::Dram);
+    EXPECT_EQ(vram_lease.resolution().memoryType, RegisteredMemoryType::Vram);
+
+    dram_lease.reset();
+    ASSERT_TRUE(manager.deregisterMemory(dram));
+    EXPECT_EQ(manager.resolve(kBase, 1, RegisteredMemoryType::Dram).status,
+              RangeResolveStatus::NotFound);
+    EXPECT_EQ(manager.resolve(kBase, 1, RegisteredMemoryType::Vram).status,
+              RangeResolveStatus::Resolved);
+    EXPECT_EQ(mock.releases.size(), 1u);
+
+    vram_lease.reset();
+    ASSERT_TRUE(manager.deregisterMemory(vram));
+    EXPECT_EQ(mock.releases.size(), 2u);
+    EXPECT_EQ(manager.rangeCount(), 0u);
 }
 
 } // namespace

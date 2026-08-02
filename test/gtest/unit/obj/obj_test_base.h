@@ -102,6 +102,7 @@ public:
                    uintptr_t data_ptr,
                    size_t data_len,
                    size_t offset,
+                   nixl_mem_t,
                    put_object_callback_t callback) override {
         std::string key_str(key);
 
@@ -135,6 +136,7 @@ public:
                    uintptr_t data_ptr,
                    size_t data_len,
                    size_t offset,
+                   nixl_mem_t,
                    get_object_callback_t callback) override {
         std::string key_str(key);
 
@@ -267,13 +269,15 @@ public:
     }
 
     void
-    putObjectAsync(std::string_view, uintptr_t, size_t, size_t, put_object_callback_t callback)
+    putObjectAsync(
+        std::string_view, uintptr_t, size_t, size_t, nixl_mem_t, put_object_callback_t callback)
         override {
         callback(true);
     }
 
     void
-    getObjectAsync(std::string_view, uintptr_t, size_t, size_t, get_object_callback_t callback)
+    getObjectAsync(
+        std::string_view, uintptr_t, size_t, size_t, nixl_mem_t, get_object_callback_t callback)
         override {
         callback(true);
     }

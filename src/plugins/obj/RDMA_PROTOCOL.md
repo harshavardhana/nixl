@@ -88,6 +88,11 @@ registered chunks is emitted as ordered token-carrying requests; GET advances
 `Range` by the bytes already transferred, while PUT uses S3 multipart upload as
 described below.
 
+DRAM and VRAM registrations occupy independent address spaces even when their
+numeric addresses are identical. Token preparation resolves only within the
+memory type declared for the local NIXL descriptor, and fragment resolution
+never crosses from one memory type into the other.
+
 Appending the per-operation start address and size to the descriptor mirrors
 cuObject's own **IO descriptor** layout (its reference server reads
 `<descriptor><rem_buf_start>…<rem_msg_size>…`); it is not an endpoint-specific

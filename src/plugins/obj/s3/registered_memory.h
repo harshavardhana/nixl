@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace nixl_obj_rdma {
@@ -22,6 +23,8 @@ enum class RegisteredMemoryType {
     Dram,
     Vram,
 };
+
+using RegisteredMemoryKey = std::pair<RegisteredMemoryType, uintptr_t>;
 
 struct RegisteredMemoryRange {
     uintptr_t descriptorBase = 0;
@@ -119,11 +122,12 @@ struct RegisteredMemoryFragments {
 };
 
 /**
- * Thread-safe registry of non-overlapping descriptor ranges.
+ * Thread-safe registry of non-overlapping descriptor ranges per memory type.
  *
- * Exact duplicates with the same memory type are reference-counted by owner.
- * Exact duplicates with a different type and all partial overlaps are rejected.
- * Adjacent ranges are valid and remain distinct registrations.
+ * DRAM and VRAM are independent address spaces, so identical or overlapping
+ * numeric ranges may coexist when their memory types differ. Within one memory
+ * type, exact duplicates are reference-counted by owner, partial overlaps are
+ * rejected, and adjacent ranges remain distinct registrations.
  */
 class RegisteredMemoryRegistry {
 public:
@@ -137,7 +141,9 @@ public:
     remove(const RegisteredMemoryRange &range, uint64_t owner_id);
 
     RegisteredMemoryResolution
-    resolve(uintptr_t request_addr, size_t request_len) const;
+    resolve(uintptr_t request_addr,
+            size_t request_len,
+            RegisteredMemoryType memory_type) const;
 
     size_t
     size() const;
@@ -156,7 +162,7 @@ private:
     checkInsertLocked(const RegisteredMemoryRange &range) const;
 
     mutable std::mutex mutex_;
-    std::map<uintptr_t, Entry> ranges_;
+    std::map<RegisteredMemoryKey, Entry> ranges_;
 };
 
 struct LogicalMemoryRegistration {
@@ -172,9 +178,11 @@ struct LogicalMemoryRegistration {
 /**
  * Transactional logical-registration manager.
  *
- * Descriptor callbacks are deliberately injected so chunking and rollback can
- * be tested without cuObject or a multi-GiB allocation. The manager serializes
- * descriptor acquisition/release with range publication and lookup.
+ * Descriptor callbacks are injected at construction so every registration,
+ * rollback, and deregistration uses the same descriptor provider. This also
+ * allows chunking and rollback to be tested without cuObject or a multi-GiB
+ * allocation. The manager serializes descriptor acquisition/release with range
+ * publication and lookup.
  */
 class RegisteredMemoryManager {
 public:
@@ -182,14 +190,27 @@ public:
         std::function<bool(uintptr_t descriptor_base, size_t registered_length)>;
     using ReleaseDescriptor = std::function<bool(uintptr_t descriptor_base)>;
 
-    explicit RegisteredMemoryManager(size_t max_registration_size);
+    RegisteredMemoryManager(size_t max_registration_size,
+                            AcquireDescriptor acquire_descriptor,
+                            ReleaseDescriptor release_descriptor);
 
+    /**
+     * Registers a memory range for access tracking and descriptor management.
+     *
+     * Splits the input range into chunks based on max_registration_size, acquiring
+     * descriptors for each chunk. Chunks are made available for lookup immediately
+     * to support concurrent resolve operations. The registration handle is populated
+     * with all created chunks on success.
+     *
+     * @param base Memory range start address
+     * @param length Memory range size
+     * @param registration Output parameter containing registered chunks on success
+     * @return true if all chunks registered successfully, false on failure
+     */
     bool
     registerMemory(uintptr_t base,
                    size_t length,
                    RegisteredMemoryType memory_type,
-                   const AcquireDescriptor &acquire_descriptor,
-                   const ReleaseDescriptor &release_descriptor,
                    LogicalMemoryRegistration &registration);
 
     /**
@@ -201,11 +222,12 @@ public:
      * even on failure.
      */
     bool
-    deregisterMemory(LogicalMemoryRegistration &registration,
-                     const ReleaseDescriptor &release_descriptor);
+    deregisterMemory(LogicalMemoryRegistration &registration);
 
     RegisteredMemoryResolution
-    resolve(uintptr_t request_addr, size_t request_len) const;
+    resolve(uintptr_t request_addr,
+            size_t request_len,
+            RegisteredMemoryType memory_type) const;
 
     /**
      * Resolve and pin a range for transfer preparation.
@@ -214,11 +236,15 @@ public:
      * descriptor release waits for all returned leases to be destroyed.
      */
     RegisteredMemoryLease
-    resolveAndAcquire(uintptr_t request_addr, size_t request_len) const;
+    resolveAndAcquire(uintptr_t request_addr,
+                      size_t request_len,
+                      RegisteredMemoryType memory_type) const;
 
     /** Resolve and pin a complete range, split at descriptor boundaries. */
     RegisteredMemoryFragments
-    resolveAndAcquireFragments(uintptr_t request_addr, size_t request_len) const;
+    resolveAndAcquireFragments(uintptr_t request_addr,
+                               size_t request_len,
+                               RegisteredMemoryType memory_type) const;
 
     size_t
     rangeCount() const;
@@ -252,10 +278,12 @@ private:
     overlapsRetiringRange(const RegisteredMemoryRange &range) const;
 
     const size_t maxRegistrationSize_;
+    const AcquireDescriptor acquireDescriptor_;
+    const ReleaseDescriptor releaseDescriptor_;
     mutable std::mutex mutex_;
     RegisteredMemoryRegistry registry_;
-    std::map<uintptr_t, std::shared_ptr<DescriptorLifetime>> lifetimes_;
-    std::map<uintptr_t, RegisteredMemoryRange> retiringRanges_;
+    std::map<RegisteredMemoryKey, std::shared_ptr<DescriptorLifetime>> lifetimes_;
+    std::map<RegisteredMemoryKey, RegisteredMemoryRange> retiringRanges_;
     uint64_t nextOwnerId_ = 1;
 };
 

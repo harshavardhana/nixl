@@ -598,13 +598,15 @@ public:
     }
 
     void
-    putObjectAsync(std::string_view, uintptr_t, size_t, size_t, put_object_callback_t callback)
+    putObjectAsync(
+        std::string_view, uintptr_t, size_t, size_t, nixl_mem_t, put_object_callback_t callback)
         override {
         callback(true);
     }
 
     void
-    getObjectAsync(std::string_view, uintptr_t, size_t, size_t, get_object_callback_t callback)
+    getObjectAsync(
+        std::string_view, uintptr_t, size_t, size_t, nixl_mem_t, get_object_callback_t callback)
         override {
         callback(true);
     }

@@ -86,59 +86,56 @@ SharedCuObjClient::registerBuffer(void *ptr,
                                   RegisteredMemoryType memory_type,
                                   LogicalMemoryRegistration &registration) {
     return registeredMemory_.registerMemory(
-        reinterpret_cast<uintptr_t>(ptr),
-        size,
-        memory_type,
-        [this](uintptr_t descriptor_base, size_t registered_length) {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
-            const cuObjErr_t rc =
-                client_->cuMemObjGetDescriptor(descriptor_ptr, registered_length);
-            if (rc != CU_OBJ_SUCCESS) {
-                NIXL_ERROR << "cuMemObjGetDescriptor failed rc=" << rc
-                           << " ptr=" << descriptor_ptr << " size=" << registered_length;
-                return false;
-            }
-            NIXL_DEBUG << "cuMemObjGetDescriptor OK ptr=" << descriptor_ptr
-                       << " size=" << registered_length;
-            return true;
-        },
-        [this](uintptr_t descriptor_base) {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
-            const cuObjErr_t rc = client_->cuMemObjPutDescriptor(descriptor_ptr);
-            if (rc != CU_OBJ_SUCCESS) {
-                NIXL_WARN << "cuMemObjPutDescriptor failed for ptr " << descriptor_ptr
-                          << " rc=" << rc;
-                return false;
-            }
-            return true;
-        },
-        registration);
+        reinterpret_cast<uintptr_t>(ptr), size, memory_type, registration);
 }
 
 bool
+SharedCuObjClient::acquireDescriptor(uintptr_t descriptor_base, size_t registered_length) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
+    const cuObjErr_t rc = client_->cuMemObjGetDescriptor(descriptor_ptr, registered_length);
+    if (rc != CU_OBJ_SUCCESS) {
+        NIXL_ERROR << "cuMemObjGetDescriptor failed rc=" << rc << " ptr=" << descriptor_ptr
+                   << " size=" << registered_length;
+        return false;
+    }
+    NIXL_DEBUG << "cuMemObjGetDescriptor OK ptr=" << descriptor_ptr
+               << " size=" << registered_length;
+    return true;
+}
+
+bool
+SharedCuObjClient::releaseDescriptor(uintptr_t descriptor_base) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
+    const cuObjErr_t rc = client_->cuMemObjPutDescriptor(descriptor_ptr);
+    if (rc != CU_OBJ_SUCCESS) {
+        NIXL_WARN << "cuMemObjPutDescriptor failed for ptr " << descriptor_ptr << " rc=" << rc;
+        return false;
+    }
+    return true;
+}
+
+
+bool
 SharedCuObjClient::deregisterBuffer(LogicalMemoryRegistration &registration) {
-    return registeredMemory_.deregisterMemory(registration, [this](uintptr_t descriptor_base) {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
-        const cuObjErr_t rc = client_->cuMemObjPutDescriptor(descriptor_ptr);
-        if (rc != CU_OBJ_SUCCESS) {
-            NIXL_WARN << "cuMemObjPutDescriptor failed for ptr " << descriptor_ptr << " rc=" << rc;
-            return false;
-        }
-        return true;
-    });
+    return registeredMemory_.deregisterMemory(registration);
 }
 
 RegisteredMemoryLease
-SharedCuObjClient::acquireBuffer(const void *ptr, size_t size) const {
-    return registeredMemory_.resolveAndAcquire(reinterpret_cast<uintptr_t>(ptr), size);
+SharedCuObjClient::acquireBuffer(const void *ptr,
+                                 size_t size,
+                                 RegisteredMemoryType memory_type) const {
+    return registeredMemory_.resolveAndAcquire(
+        reinterpret_cast<uintptr_t>(ptr), size, memory_type);
 }
 
 RegisteredMemoryFragments
-SharedCuObjClient::acquireBuffers(const void *ptr, size_t size) const {
-    return registeredMemory_.resolveAndAcquireFragments(reinterpret_cast<uintptr_t>(ptr), size);
+SharedCuObjClient::acquireBuffers(const void *ptr,
+                                  size_t size,
+                                  RegisteredMemoryType memory_type) const {
+    return registeredMemory_.resolveAndAcquireFragments(
+        reinterpret_cast<uintptr_t>(ptr), size, memory_type);
 }
 
 bool
@@ -665,8 +662,9 @@ rdmaPutWithRetry(RdmaMemoryProvider &rdma,
                  RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
-                 size_t size) {
-    RegisteredMemoryFragments fragments = rdma.acquireBuffers(buf, size);
+                 size_t size,
+                 RegisteredMemoryType memory_type) {
+    RegisteredMemoryFragments fragments = rdma.acquireBuffers(buf, size, memory_type);
     if (!fragments.valid()) {
         NIXL_ERROR << "RDMA PUT range is not fully registered: status="
                    << static_cast<int>(fragments.status) << " ptr=" << buf << " size=" << size;
@@ -774,8 +772,9 @@ rdmaGetWithRetry(RdmaMemoryProvider &rdma,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size,
-                 size_t offset) {
-    RegisteredMemoryFragments fragments = rdma.acquireBuffers(buf, size);
+                 size_t offset,
+                 RegisteredMemoryType memory_type) {
+    RegisteredMemoryFragments fragments = rdma.acquireBuffers(buf, size, memory_type);
     if (!fragments.valid()) {
         NIXL_ERROR << "RDMA GET range is not fully registered: status="
                    << static_cast<int>(fragments.status) << " ptr=" << buf << " size=" << size;

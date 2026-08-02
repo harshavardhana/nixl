@@ -171,11 +171,21 @@ protected:
     getClient() const override;
 
 private:
+    bool
+    acquireDescriptor(uintptr_t descriptor_base, size_t registered_length);
+    bool
+    releaseDescriptor(uintptr_t descriptor_base);
+
     /// S3 client for Dell ObjectScale operations
     std::shared_ptr<iS3Client> s3Client_;
     /// cuObject client for RDMA operations
     std::shared_ptr<iDellCuObjClient> cuClient_;
-    mutable nixl_obj_rdma::RegisteredMemoryManager registeredMemory_{CUOBJ_MAX_MEMORY_REG_SIZE - 1};
+    mutable nixl_obj_rdma::RegisteredMemoryManager registeredMemory_{
+        CUOBJ_MAX_MEMORY_REG_SIZE - 1,
+        [this](uintptr_t descriptor_base, size_t registered_length) {
+            return acquireDescriptor(descriptor_base, registered_length);
+        },
+        [this](uintptr_t descriptor_base) { return releaseDescriptor(descriptor_base); }};
     mutable std::mutex cuClientMutex_;
     mutable std::mutex objectMapMutex_;
 };
