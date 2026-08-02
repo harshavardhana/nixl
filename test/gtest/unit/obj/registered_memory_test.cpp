@@ -418,5 +418,61 @@ TEST(RegisteredMemoryManagerTest, ConcurrentLookupDuplicateAndAdjacentRegistrati
     EXPECT_EQ(manager.rangeCount(), 0u);
 }
 
+TEST(RegisteredMemoryManagerTest, ResolvesAndPinsOrderedCrossDescriptorFragments) {
+    RegisteredMemoryManager manager(1024);
+    DescriptorMock mock;
+    LogicalMemoryRegistration registration;
+    ASSERT_TRUE(manager.registerMemory(kBase,
+                                       3072,
+                                       RegisteredMemoryType::Dram,
+                                       mock.acquireCallback(),
+                                       mock.releaseCallback(),
+                                       registration));
+
+    auto fragments = manager.resolveAndAcquireFragments(kBase + 100, 2500);
+    ASSERT_TRUE(fragments.valid());
+    ASSERT_EQ(fragments.leases.size(), 3u);
+    EXPECT_EQ(fragments.leases[0].resolution().descriptorBase, kBase);
+    EXPECT_EQ(fragments.leases[0].resolution().registrationOffset, 100u);
+    EXPECT_EQ(fragments.leases[1].resolution().descriptorBase, kBase + 1024);
+    EXPECT_EQ(fragments.leases[1].resolution().registrationOffset, 0u);
+    EXPECT_EQ(fragments.leases[2].resolution().descriptorBase, kBase + 2048);
+
+    auto deregistration = std::async(std::launch::async, [&]() {
+        return manager.deregisterMemory(registration, mock.releaseCallback());
+    });
+    EXPECT_EQ(deregistration.wait_for(std::chrono::milliseconds(10)),
+              std::future_status::timeout);
+    fragments.leases.clear();
+    EXPECT_TRUE(deregistration.get());
+    EXPECT_EQ(manager.rangeCount(), 0u);
+}
+
+TEST(RegisteredMemoryManagerTest, FragmentResolutionRejectsGapsWithoutRetainingLeases) {
+    RegisteredMemoryManager manager(1024);
+    DescriptorMock mock;
+    LogicalMemoryRegistration first;
+    LogicalMemoryRegistration second;
+    ASSERT_TRUE(manager.registerMemory(kBase,
+                                       1024,
+                                       RegisteredMemoryType::Dram,
+                                       mock.acquireCallback(),
+                                       mock.releaseCallback(),
+                                       first));
+    ASSERT_TRUE(manager.registerMemory(kBase + 2048,
+                                       1024,
+                                       RegisteredMemoryType::Dram,
+                                       mock.acquireCallback(),
+                                       mock.releaseCallback(),
+                                       second));
+
+    auto fragments = manager.resolveAndAcquireFragments(kBase + 512, 2048);
+    EXPECT_FALSE(fragments.valid());
+    EXPECT_EQ(fragments.status, RangeResolveStatus::NotFound);
+    EXPECT_TRUE(fragments.leases.empty());
+    EXPECT_TRUE(manager.deregisterMemory(first, mock.releaseCallback()));
+    EXPECT_TRUE(manager.deregisterMemory(second, mock.releaseCallback()));
+}
+
 } // namespace
 } // namespace gtest::obj

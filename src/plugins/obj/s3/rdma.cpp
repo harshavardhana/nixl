@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -25,6 +26,12 @@
 #include <aws/core/utils/DateTime.h>
 #include <aws/core/utils/HashingUtils.h>
 #include <aws/core/utils/StringUtils.h>
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/AbortMultipartUploadRequest.h>
+#include <aws/s3/model/CompleteMultipartUploadRequest.h>
+#include <aws/s3/model/CompletedMultipartUpload.h>
+#include <aws/s3/model/CompletedPart.h>
+#include <aws/s3/model/CreateMultipartUploadRequest.h>
 
 #include "object/s3/utils.h"
 #include "object/s3/aws_sdk_init.h"
@@ -129,6 +136,11 @@ SharedCuObjClient::acquireBuffer(const void *ptr, size_t size) const {
     return registeredMemory_.resolveAndAcquire(reinterpret_cast<uintptr_t>(ptr), size);
 }
 
+RegisteredMemoryFragments
+SharedCuObjClient::acquireBuffers(const void *ptr, size_t size) const {
+    return registeredMemory_.resolveAndAcquireFragments(reinterpret_cast<uintptr_t>(ptr), size);
+}
+
 bool
 SharedCuObjClient::isDeviceMemory(const void *ptr) const {
     return cuObjClient::getMemoryType(ptr) == CUOBJ_MEMORY_CUDA_DEVICE;
@@ -175,6 +187,7 @@ struct S3RdmaControlPlane::Impl {
     Aws::String region;
     bool virtual_addressing = false;
     std::shared_ptr<Aws::Http::HttpClient> http;
+    std::shared_ptr<Aws::S3::S3Client> s3;
     Aws::String access_key;
     Aws::String secret_key;
     Aws::String session_token;
@@ -334,8 +347,13 @@ S3RdmaControlPlane::S3RdmaControlPlane(nixl_b_params_t *custom_params) : impl_(n
         config.connectTimeoutMs = rdma_connect_timeout_secs * 1000;
         config.requestTimeoutMs = rdma_timeout_secs * 1000;
         impl_->http = Aws::Http::CreateHttpClient(config);
+        impl_->s3 = std::make_shared<Aws::S3::S3Client>(
+            creds,
+            config,
+            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::RequestDependent,
+            impl_->virtual_addressing);
 
-        valid_ = impl_->http != nullptr && !impl_->access_key.empty();
+        valid_ = impl_->http != nullptr && impl_->s3 != nullptr && !impl_->access_key.empty();
     }
     catch (const std::exception &e) {
         NIXL_WARN << "S3 RDMA control plane init failed: " << e.what();
@@ -344,6 +362,83 @@ S3RdmaControlPlane::S3RdmaControlPlane(nixl_b_params_t *custom_params) : impl_(n
 }
 
 S3RdmaControlPlane::~S3RdmaControlPlane() = default;
+
+bool
+S3RdmaControlPlane::beginMultipartUpload(S3RdmaClientCtx &ctx) {
+    if (!valid_ || ctx.bucket.empty() || ctx.object.empty()) {
+        return false;
+    }
+
+    Aws::S3::Model::CreateMultipartUploadRequest request;
+    request.WithBucket(ctx.bucket.c_str()).WithKey(ctx.object.c_str());
+    const auto outcome = impl_->s3->CreateMultipartUpload(request);
+    if (!outcome.IsSuccess()) {
+        NIXL_ERROR << "CreateMultipartUpload failed for key=" << ctx.object << ": "
+                   << outcome.GetError().GetExceptionName() << ": "
+                   << outcome.GetError().GetMessage();
+        return false;
+    }
+
+    ctx.upload_id = outcome.GetResult().GetUploadId().c_str();
+    return !ctx.upload_id.empty();
+}
+
+bool
+S3RdmaControlPlane::completeMultipartUpload(
+    S3RdmaClientCtx &ctx, const std::vector<RdmaMultipartPart> &parts) {
+    if (!valid_ || ctx.upload_id.empty() || parts.empty()) {
+        return false;
+    }
+
+    Aws::S3::Model::CompletedMultipartUpload completed;
+    for (const auto &part : parts) {
+        if (part.partNumber == 0 || part.partNumber > 10000 || part.etag.empty()) {
+            return false;
+        }
+        Aws::S3::Model::CompletedPart completed_part;
+        completed_part.WithPartNumber(static_cast<int>(part.partNumber))
+            .WithETag(part.etag.c_str());
+        completed.AddParts(std::move(completed_part));
+    }
+
+    Aws::S3::Model::CompleteMultipartUploadRequest request;
+    request.WithBucket(ctx.bucket.c_str())
+        .WithKey(ctx.object.c_str())
+        .WithUploadId(ctx.upload_id.c_str())
+        .WithMultipartUpload(std::move(completed));
+    const auto outcome = impl_->s3->CompleteMultipartUpload(request);
+    if (!outcome.IsSuccess()) {
+        NIXL_ERROR << "CompleteMultipartUpload failed for key=" << ctx.object << ": "
+                   << outcome.GetError().GetExceptionName() << ": "
+                   << outcome.GetError().GetMessage();
+        return false;
+    }
+
+    ctx.etag = stripQuotes(outcome.GetResult().GetETag().c_str());
+    ctx.upload_id.clear();
+    ctx.part_number = 0;
+    return true;
+}
+
+void
+S3RdmaControlPlane::abortMultipartUpload(S3RdmaClientCtx &ctx) {
+    if (!valid_ || ctx.upload_id.empty()) {
+        return;
+    }
+
+    Aws::S3::Model::AbortMultipartUploadRequest request;
+    request.WithBucket(ctx.bucket.c_str())
+        .WithKey(ctx.object.c_str())
+        .WithUploadId(ctx.upload_id.c_str());
+    const auto outcome = impl_->s3->AbortMultipartUpload(request);
+    if (!outcome.IsSuccess()) {
+        NIXL_WARN << "AbortMultipartUpload failed for key=" << ctx.object << ": "
+                  << outcome.GetError().GetExceptionName() << ": "
+                  << outcome.GetError().GetMessage();
+    }
+    ctx.upload_id.clear();
+    ctx.part_number = 0;
+}
 
 ssize_t
 S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx &ctx,
@@ -497,49 +592,180 @@ S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx &ctx,
 // retried rather than aborting on the first attempt.
 // ---------------------------------------------------------------------------
 
-ssize_t
-rdmaPutWithRetry(RdmaMemoryProvider &rdma,
-                 RdmaControlPlane &cp,
-                 S3RdmaClientCtx &ctx,
-                 void *buf,
-                 size_t size) {
-    RegisteredMemoryLease lease = rdma.acquireBuffer(buf, size);
-    if (!lease.valid()) {
-        NIXL_ERROR << "RDMA PUT range is not contained in one registered descriptor: status="
-                   << static_cast<int>(lease.resolution().status) << " ptr=" << buf
-                   << " size=" << size;
-        return rdma_error;
-    }
+namespace {
 
-    const RegisteredMemoryResolution &resolution = lease.resolution();
+constexpr size_t s3_min_multipart_part_size = 5 * 1024 * 1024;
+
+size_t
+fragmentSize(const RegisteredMemoryResolution &resolution, size_t remaining) {
+    return std::min(remaining, resolution.registeredLength - resolution.registrationOffset);
+}
+
+ssize_t
+transferFragmentWithRetry(RdmaMemoryProvider &rdma,
+                          RdmaControlPlane &cp,
+                          S3RdmaClientCtx &ctx,
+                          const RegisteredMemoryResolution &resolution,
+                          size_t fragment_size,
+                          cuObjOpType_t operation,
+                          size_t object_offset) {
     void *descriptor_base = reinterpret_cast<void *>(resolution.descriptorBase);
     const uint64_t data_address =
         static_cast<uint64_t>(resolution.descriptorBase + resolution.registrationOffset);
     ssize_t ret = rdma_error;
     for (int attempt = 0; attempt < rdma_max_attempts; ++attempt) {
         char *token =
-            rdma.getToken(descriptor_base, size, resolution.registrationOffset, CUOBJ_PUT);
+            rdma.getToken(descriptor_base, fragment_size, resolution.registrationOffset, operation);
         if (token == nullptr) {
-            ret = rdma_error;
-            continue; // transient mint failure: retry
+            continue;
         }
         try {
-            ret = cp.rdmaPut(ctx, token, data_address, size);
+            ret = operation == CUOBJ_PUT
+                      ? cp.rdmaPut(ctx, token, data_address, fragment_size)
+                      : cp.rdmaGet(ctx, token, data_address, fragment_size, object_offset);
         }
         catch (const std::exception &e) {
-            NIXL_ERROR << "RDMA PUT control-plane exception: " << e.what();
+            NIXL_ERROR << "RDMA control-plane exception: " << e.what();
             ret = rdma_error;
         }
         catch (...) {
-            NIXL_ERROR << "RDMA PUT control-plane exception";
+            NIXL_ERROR << "RDMA control-plane exception";
             ret = rdma_error;
         }
         rdma.putToken(token);
-        if (ret > 0 || ret == rdma_not_supported) {
+        if (ret == static_cast<ssize_t>(fragment_size) || ret == rdma_not_supported) {
             break;
+        }
+        if (ret > 0) {
+            NIXL_WARN << "RDMA fragment transferred " << ret << " of " << fragment_size
+                      << " bytes; retrying the complete fragment";
+            ret = rdma_error;
         }
     }
     return ret;
+}
+
+void
+abortMultipartNoThrow(RdmaControlPlane &cp, S3RdmaClientCtx &ctx) {
+    try {
+        cp.abortMultipartUpload(ctx);
+    }
+    catch (const std::exception &e) {
+        NIXL_WARN << "AbortMultipartUpload threw: " << e.what();
+    }
+    catch (...) {
+        NIXL_WARN << "AbortMultipartUpload threw";
+    }
+}
+
+} // namespace
+
+ssize_t
+rdmaPutWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
+                 S3RdmaClientCtx &ctx,
+                 void *buf,
+                 size_t size) {
+    RegisteredMemoryFragments fragments = rdma.acquireBuffers(buf, size);
+    if (!fragments.valid()) {
+        NIXL_ERROR << "RDMA PUT range is not fully registered: status="
+                   << static_cast<int>(fragments.status) << " ptr=" << buf << " size=" << size;
+        return rdma_error;
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        NIXL_ERROR << "RDMA PUT size exceeds ssize_t result range: " << size;
+        return rdma_error;
+    }
+
+    if (fragments.leases.size() == 1) {
+        return transferFragmentWithRetry(rdma,
+                                         cp,
+                                         ctx,
+                                         fragments.leases.front().resolution(),
+                                         size,
+                                         CUOBJ_PUT,
+                                         0);
+    }
+    if (fragments.leases.size() > 10000) {
+        NIXL_ERROR << "RDMA multipart PUT needs " << fragments.leases.size()
+                   << " parts, exceeding the S3 limit of 10000";
+        return rdma_error;
+    }
+
+    size_t remaining = size;
+    for (size_t i = 0; i + 1 < fragments.leases.size(); ++i) {
+        const size_t fragment_size = fragmentSize(fragments.leases[i].resolution(), remaining);
+        if (fragment_size < s3_min_multipart_part_size) {
+            NIXL_ERROR << "RDMA multipart PUT fragment " << (i + 1) << " is " << fragment_size
+                       << " bytes; non-final S3 parts require at least "
+                       << s3_min_multipart_part_size << " bytes";
+            return rdma_error;
+        }
+        remaining -= fragment_size;
+    }
+
+    try {
+        if (!cp.beginMultipartUpload(ctx)) {
+            if (!ctx.upload_id.empty()) {
+                abortMultipartNoThrow(cp, ctx);
+            }
+            NIXL_ERROR << "RDMA multipart PUT could not be initiated for key=" << ctx.object;
+            return rdma_error;
+        }
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "CreateMultipartUpload threw: " << e.what();
+        if (!ctx.upload_id.empty()) {
+            abortMultipartNoThrow(cp, ctx);
+        }
+        return rdma_error;
+    }
+    catch (...) {
+        NIXL_ERROR << "CreateMultipartUpload threw";
+        if (!ctx.upload_id.empty()) {
+            abortMultipartNoThrow(cp, ctx);
+        }
+        return rdma_error;
+    }
+
+    std::vector<RdmaMultipartPart> completed_parts;
+    completed_parts.reserve(fragments.leases.size());
+    size_t bytes_done = 0;
+    for (size_t i = 0; i < fragments.leases.size(); ++i) {
+        const auto &resolution = fragments.leases[i].resolution();
+        const size_t fragment_size = fragmentSize(resolution, size - bytes_done);
+        ctx.part_number = static_cast<uint32_t>(i + 1);
+        ctx.etag.clear();
+        const ssize_t ret = transferFragmentWithRetry(
+            rdma, cp, ctx, resolution, fragment_size, CUOBJ_PUT, 0);
+        if (ret != static_cast<ssize_t>(fragment_size) || ctx.etag.empty()) {
+            NIXL_ERROR << "RDMA multipart PUT failed at part " << ctx.part_number
+                       << " after " << bytes_done << " bytes";
+            abortMultipartNoThrow(cp, ctx);
+            return ret < 0 ? ret : rdma_error;
+        }
+        completed_parts.push_back({ctx.part_number, ctx.etag});
+        bytes_done += fragment_size;
+    }
+
+    try {
+        if (!cp.completeMultipartUpload(ctx, completed_parts)) {
+            NIXL_ERROR << "RDMA multipart PUT completion failed for key=" << ctx.object;
+            abortMultipartNoThrow(cp, ctx);
+            return rdma_error;
+        }
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "CompleteMultipartUpload threw: " << e.what();
+        abortMultipartNoThrow(cp, ctx);
+        return rdma_error;
+    }
+    catch (...) {
+        NIXL_ERROR << "CompleteMultipartUpload threw";
+        abortMultipartNoThrow(cp, ctx);
+        return rdma_error;
+    }
+    return static_cast<ssize_t>(bytes_done);
 }
 
 ssize_t
@@ -549,43 +775,36 @@ rdmaGetWithRetry(RdmaMemoryProvider &rdma,
                  void *buf,
                  size_t size,
                  size_t offset) {
-    RegisteredMemoryLease lease = rdma.acquireBuffer(buf, size);
-    if (!lease.valid()) {
-        NIXL_ERROR << "RDMA GET range is not contained in one registered descriptor: status="
-                   << static_cast<int>(lease.resolution().status) << " ptr=" << buf
-                   << " size=" << size;
+    RegisteredMemoryFragments fragments = rdma.acquireBuffers(buf, size);
+    if (!fragments.valid()) {
+        NIXL_ERROR << "RDMA GET range is not fully registered: status="
+                   << static_cast<int>(fragments.status) << " ptr=" << buf << " size=" << size;
+        return rdma_error;
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<ssize_t>::max()) ||
+        (size != 0 && offset > std::numeric_limits<size_t>::max() - (size - 1))) {
+        NIXL_ERROR << "RDMA GET size or object range overflows";
         return rdma_error;
     }
 
-    const RegisteredMemoryResolution &resolution = lease.resolution();
-    void *descriptor_base = reinterpret_cast<void *>(resolution.descriptorBase);
-    const uint64_t data_address =
-        static_cast<uint64_t>(resolution.descriptorBase + resolution.registrationOffset);
-    ssize_t ret = rdma_error;
-    for (int attempt = 0; attempt < rdma_max_attempts; ++attempt) {
-        char *token =
-            rdma.getToken(descriptor_base, size, resolution.registrationOffset, CUOBJ_GET);
-        if (token == nullptr) {
-            ret = rdma_error;
-            continue; // transient mint failure: retry
+    size_t bytes_done = 0;
+    for (const auto &lease : fragments.leases) {
+        const auto &resolution = lease.resolution();
+        const size_t fragment_size = fragmentSize(resolution, size - bytes_done);
+        const ssize_t ret = transferFragmentWithRetry(rdma,
+                                                      cp,
+                                                      ctx,
+                                                      resolution,
+                                                      fragment_size,
+                                                      CUOBJ_GET,
+                                                      offset + bytes_done);
+        if (ret != static_cast<ssize_t>(fragment_size)) {
+            NIXL_ERROR << "RDMA fragmented GET failed after " << bytes_done << " bytes";
+            return ret < 0 ? ret : rdma_error;
         }
-        try {
-            ret = cp.rdmaGet(ctx, token, data_address, size, offset);
-        }
-        catch (const std::exception &e) {
-            NIXL_ERROR << "RDMA GET control-plane exception: " << e.what();
-            ret = rdma_error;
-        }
-        catch (...) {
-            NIXL_ERROR << "RDMA GET control-plane exception";
-            ret = rdma_error;
-        }
-        rdma.putToken(token);
-        if (ret > 0 || ret == rdma_not_supported) {
-            break;
-        }
+        bytes_done += fragment_size;
     }
-    return ret;
+    return static_cast<ssize_t>(bytes_done);
 }
 
 } // namespace nixl_obj_rdma

@@ -237,7 +237,7 @@ TEST_F(DellRegisteredTransferTest, RejectsUnregisteredAndOverrunBeforeCuObjectTr
 }
 
 TEST_F(DellRegisteredTransferTest, ChunksLargeRegistrationAndRejectsCrossChunkTransfer) {
-    constexpr size_t kMax = CUOBJ_MAX_MEMORY_REG_SIZE;
+    constexpr size_t kMax = CUOBJ_MAX_MEMORY_REG_SIZE - 1;
     nixlBlobDesc memory = {};
     memory.addr = kBase;
     memory.len = kMax + 16;
@@ -262,7 +262,7 @@ TEST_F(DellRegisteredTransferTest, ChunksLargeRegistrationAndRejectsCrossChunkTr
 }
 
 TEST_F(DellRegisteredTransferTest, ChunkRegistrationFailureRollsBackTransaction) {
-    constexpr size_t kMax = CUOBJ_MAX_MEMORY_REG_SIZE;
+    constexpr size_t kMax = CUOBJ_MAX_MEMORY_REG_SIZE - 1;
     cu_->failRegistration = 2;
     nixlBlobDesc memory = {};
     memory.addr = kBase;
