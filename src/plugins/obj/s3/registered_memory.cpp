@@ -14,9 +14,7 @@
 namespace nixl_obj_rdma {
 
 bool
-RegisteredMemoryRegistry::getLastAddress(uintptr_t base,
-                                         size_t length,
-                                         uintptr_t &last_address) {
+RegisteredMemoryRegistry::getLastAddress(uintptr_t base, size_t length, uintptr_t &last_address) {
     if (length == 0 || length - 1 > std::numeric_limits<uintptr_t>::max() - base) {
         return false;
     }
@@ -65,9 +63,8 @@ RegisteredMemoryRegistry::insert(const RegisteredMemoryRange &range, uint64_t ow
     if (result == RangeInsertResult::Inserted) {
         uintptr_t last_address = 0;
         getLastAddress(range.descriptorBase, range.length, last_address);
-        ranges_.emplace(
-            range.descriptorBase,
-            Entry{range, last_address, std::unordered_set<uint64_t>{owner_id}});
+        ranges_.emplace(range.descriptorBase,
+                        Entry{range, last_address, std::unordered_set<uint64_t>{owner_id}});
         return result;
     }
     if (result == RangeInsertResult::Duplicate) {
@@ -128,8 +125,9 @@ RegisteredMemoryRegistry::resolve(uintptr_t request_addr, size_t request_len) co
                 entry.range.memoryType,
                 entry.owners.size()};
     }
-
     // Distinguish a request fully covered by adjacent registrations from a
+    // partial/unregistered request. Single-descriptor callers receive a stable
+    // cross-registration result; aggregate callers resolve each chunk in order.
     // partial/unregistered request. Phase 3 rejects both, but callers need a
     // stable cross-registration result for the former.
     auto current = std::next(containing_start);
@@ -143,6 +141,84 @@ RegisteredMemoryRegistry::resolve(uintptr_t request_addr, size_t request_len) co
         ++current;
     }
     return {RangeResolveStatus::NotFound};
+}
+
+RegisteredMemoryFragments
+RegisteredMemoryManager::resolveAndAcquireFragments(uintptr_t request_addr,
+                                                    size_t request_len) const {
+    RegisteredMemoryFragments fragments;
+    if (request_len == 0) {
+        fragments.status = RangeResolveStatus::ZeroLength;
+        return fragments;
+    }
+    if (request_len - 1 > std::numeric_limits<uintptr_t>::max() - request_addr) {
+        fragments.status = RangeResolveStatus::AddressOverflow;
+        return fragments;
+    }
+
+    const std::lock_guard<std::mutex> lock(mutex_);
+    uintptr_t current = request_addr;
+    size_t remaining = request_len;
+    while (remaining != 0) {
+        const RegisteredMemoryResolution resolution = registry_.resolve(current, 1);
+        if (resolution.status != RangeResolveStatus::Resolved) {
+            fragments.leases.clear();
+            fragments.status = resolution.status;
+            return fragments;
+        }
+
+        auto lifetime = lifetimes_.find(resolution.descriptorBase);
+        if (lifetime == lifetimes_.end()) {
+            fragments.leases.clear();
+            fragments.status = RangeResolveStatus::NotFound;
+            return fragments;
+        }
+
+        const size_t available = resolution.registeredLength - resolution.registrationOffset;
+        const size_t fragment_length = std::min(remaining, available);
+        std::shared_ptr<LeaseToken> token;
+        {
+            const std::lock_guard<std::mutex> lifetime_lock(lifetime->second->mutex);
+            if (lifetime->second->retiring) {
+                fragments.leases.clear();
+                fragments.status = RangeResolveStatus::NotFound;
+                return fragments;
+            }
+            ++lifetime->second->activeLeases;
+        }
+
+        try {
+            token = std::make_shared<LeaseToken>(lifetime->second);
+        }
+        catch (...) {
+            const std::lock_guard<std::mutex> lifetime_lock(lifetime->second->mutex);
+            --lifetime->second->activeLeases;
+            if (lifetime->second->activeLeases == 0) {
+                lifetime->second->condition.notify_all();
+            }
+            fragments.leases.clear();
+            fragments.status = RangeResolveStatus::NotFound;
+            return fragments;
+        }
+
+        try {
+            RegisteredMemoryLease lease(resolution, token);
+            fragments.leases.push_back(std::move(lease));
+        }
+        catch (...) {
+            fragments.leases.clear();
+            fragments.status = RangeResolveStatus::NotFound;
+            return fragments;
+        }
+
+        remaining -= fragment_length;
+        if (remaining != 0) {
+            current += fragment_length;
+        }
+    }
+
+    fragments.status = RangeResolveStatus::Resolved;
+    return fragments;
 }
 
 size_t
@@ -222,8 +298,7 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
                                         const ReleaseDescriptor &release_descriptor,
                                         LogicalMemoryRegistration &registration) {
     registration = {};
-    const char *memory_type_name =
-        memory_type == RegisteredMemoryType::Vram ? "VRAM" : "DRAM";
+    const char *memory_type_name = memory_type == RegisteredMemoryType::Vram ? "VRAM" : "DRAM";
     NIXL_INFO << "registerMemory: request base=" << reinterpret_cast<void *>(base)
               << " length=" << length << " memory_type=" << memory_type_name
               << " max_chunk_size=" << maxRegistrationSize_;
@@ -248,8 +323,7 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
         const auto &chunk = chunks[i];
         NIXL_INFO << "registerMemory: planned chunk=" << (i + 1) << "/" << chunks.size()
                   << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                  << " last="
-                  << reinterpret_cast<void *>(chunk.descriptorBase + chunk.length - 1)
+                  << " last=" << reinterpret_cast<void *>(chunk.descriptorBase + chunk.length - 1)
                   << " length=" << chunk.length << " memory_type=" << memory_type_name;
     }
 
@@ -266,9 +340,9 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
             return false;
         }
         const RangeInsertResult result = registry_.checkInsert(chunk);
-        const char *registry_state = result == RangeInsertResult::Inserted ? "new"
-                                     : result == RangeInsertResult::Duplicate ? "duplicate"
-                                                                             : "rejected";
+        const char *registry_state = result == RangeInsertResult::Inserted ? "new" :
+            result == RangeInsertResult::Duplicate                         ? "duplicate" :
+                                                                             "rejected";
         NIXL_INFO << "registerMemory: checked chunk=" << (i + 1) << "/" << chunks.size()
                   << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
                   << " length=" << chunk.length << " registry_state=" << registry_state;
@@ -324,23 +398,20 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
         NIXL_ERROR << "registerMemory: acquisition failure dump"
                    << " request_base=" << reinterpret_cast<void *>(base)
                    << " request_length=" << length << " memory_type=" << memory_type_name
-                   << " chunks=" << chunks.size()
-                   << " failed_chunk="
+                   << " chunks=" << chunks.size() << " failed_chunk="
                    << (failed_chunk_index < chunks.size() ? failed_chunk_index + 1 : 0);
         for (size_t i = 0; i < chunks.size(); ++i) {
             const auto &chunk = chunks[i];
             const bool was_acquired =
                 std::find(acquired.begin(), acquired.end(), chunk.descriptorBase) != acquired.end();
-            const char *descriptor_state = !needs_descriptor[i]   ? "reused"
-                                           : was_acquired         ? "acquired"
-                                           : i == failed_chunk_index ? "failed"
-                                                                     : "not-attempted";
+            const char *descriptor_state = !needs_descriptor[i] ? "reused" :
+                was_acquired                                    ? "acquired" :
+                i == failed_chunk_index                         ? "failed" :
+                                                                  "not-attempted";
             NIXL_ERROR << "registerMemory: failure chunk=" << (i + 1) << "/" << chunks.size()
-                       << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                       << " last="
+                       << " base=" << reinterpret_cast<void *>(chunk.descriptorBase) << " last="
                        << reinterpret_cast<void *>(chunk.descriptorBase + chunk.length - 1)
-                       << " length=" << chunk.length
-                       << " descriptor_state=" << descriptor_state;
+                       << " length=" << chunk.length << " descriptor_state=" << descriptor_state;
         }
         NIXL_INFO << "registerMemory: rolling back " << acquired.size()
                   << " acquired descriptor(s)";
@@ -399,11 +470,9 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
             }
             committed.push_back(chunk);
             NIXL_INFO << "registerMemory: published chunk"
-                      << " owner_id=" << owner_id << " chunk=" << (i + 1) << "/"
-                      << chunks.size()
+                      << " owner_id=" << owner_id << " chunk=" << (i + 1) << "/" << chunks.size()
                       << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                      << " length=" << chunk.length
-                      << " registry_state="
+                      << " length=" << chunk.length << " registry_state="
                       << (result == RangeInsertResult::Inserted ? "new" : "duplicate");
             if (result == RangeInsertResult::Inserted) {
                 lifetimes_.emplace(chunk.descriptorBase, std::move(new_lifetimes[i]));
@@ -442,9 +511,8 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
     registration.ownerId = owner_id;
     registration.chunks = std::move(chunks);
     NIXL_INFO << "registerMemory: registration complete"
-              << " owner_id=" << registration.ownerId
-              << " base=" << reinterpret_cast<void *>(base) << " length=" << length
-              << " chunks=" << registration.chunks.size()
+              << " owner_id=" << registration.ownerId << " base=" << reinterpret_cast<void *>(base)
+              << " length=" << length << " chunks=" << registration.chunks.size()
               << " newly_acquired_descriptors=" << acquired.size();
     return true;
 }
@@ -458,10 +526,12 @@ RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registratio
 
     std::unique_lock<std::mutex> lock(mutex_);
     bool success = true;
+
     struct PendingRelease {
         RegisteredMemoryRange range;
         std::shared_ptr<DescriptorLifetime> lifetime;
     };
+
     std::vector<PendingRelease> descriptors_to_release;
     descriptors_to_release.reserve(registration.chunks.size());
     for (const auto &chunk : registration.chunks) {

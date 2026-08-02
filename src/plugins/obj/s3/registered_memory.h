@@ -101,6 +101,24 @@ private:
 };
 
 /**
+ * An ordered decomposition of one transfer range into registered descriptors.
+ *
+ * Every lease is acquired atomically with respect to registration and
+ * deregistration. A valid result covers the complete requested range without
+ * gaps; callers can process the leases in order while retaining all descriptor
+ * lifetime pins until the aggregate transfer finishes.
+ */
+struct RegisteredMemoryFragments {
+    RangeResolveStatus status = RangeResolveStatus::NotFound;
+    std::vector<RegisteredMemoryLease> leases;
+
+    bool
+    valid() const {
+        return status == RangeResolveStatus::Resolved && !leases.empty();
+    }
+};
+
+/**
  * Thread-safe registry of non-overlapping descriptor ranges.
  *
  * Exact duplicates with the same memory type are reference-counted by owner.
@@ -197,6 +215,10 @@ public:
      */
     RegisteredMemoryLease
     resolveAndAcquire(uintptr_t request_addr, size_t request_len) const;
+
+    /** Resolve and pin a complete range, split at descriptor boundaries. */
+    RegisteredMemoryFragments
+    resolveAndAcquireFragments(uintptr_t request_addr, size_t request_len) const;
 
     size_t
     rangeCount() const;

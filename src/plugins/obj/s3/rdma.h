@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <cuobjclient.h>
 
@@ -50,12 +51,20 @@ struct S3RdmaClientCtx {
     std::string etag; // populated on success
 };
 
+struct RdmaMultipartPart {
+    uint32_t partNumber = 0;
+    std::string etag;
+};
+
 class RdmaMemoryProvider {
 public:
     virtual ~RdmaMemoryProvider() = default;
 
     virtual RegisteredMemoryLease
     acquireBuffer(const void *ptr, size_t size) const = 0;
+
+    virtual RegisteredMemoryFragments
+    acquireBuffers(const void *ptr, size_t size) const = 0;
 
     virtual char *
     getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op) = 0;
@@ -77,6 +86,15 @@ public:
             uint64_t buf_addr,
             uint64_t size,
             uint64_t offset) = 0;
+
+    virtual bool
+    beginMultipartUpload(S3RdmaClientCtx &ctx) = 0;
+
+    virtual bool
+    completeMultipartUpload(S3RdmaClientCtx &ctx, const std::vector<RdmaMultipartPart> &parts) = 0;
+
+    virtual void
+    abortMultipartUpload(S3RdmaClientCtx &ctx) = 0;
 };
 
 /**
@@ -114,6 +132,10 @@ public:
     /// Resolve and pin a complete transfer range to its registered descriptor.
     RegisteredMemoryLease
     acquireBuffer(const void *ptr, size_t size) const override;
+
+    /// Resolve and pin a transfer, splitting it at descriptor boundaries.
+    RegisteredMemoryFragments
+    acquireBuffers(const void *ptr, size_t size) const override;
 
     /// True if the pointer is CUDA device (VRAM) memory (no HTTP fallback possible).
     bool
@@ -174,6 +196,16 @@ public:
             uint64_t buf_addr,
             uint64_t size,
             uint64_t offset) override;
+
+    bool
+    beginMultipartUpload(S3RdmaClientCtx &ctx) override;
+
+    bool
+    completeMultipartUpload(S3RdmaClientCtx &ctx,
+                            const std::vector<RdmaMultipartPart> &parts) override;
+
+    void
+    abortMultipartUpload(S3RdmaClientCtx &ctx) override;
 
 private:
     struct Impl;

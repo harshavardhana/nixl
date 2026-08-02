@@ -144,11 +144,13 @@ interior transfer is prepared with the owning chunk's registered base pointer
 and the registration-relative memory offset; the remote object's offset remains
 separate and is passed only to the S3 operation.
 
-The complete transfer must currently fit inside one chunk. Unregistered,
-partially registered, and cross-chunk transfers fail during preparation before
-the Dell S3 request is submitted. Deregistration prevents new preparation for
-the range and waits for in-flight operations before releasing descriptors.
-Exact duplicate registrations share descriptors; partial overlaps are rejected.
+The complete Dell transfer must currently fit inside one chunk. This restriction
+is specific to the vendor protocol; the standard `type=s3` engine fragments
+cross-chunk GETs and uses multipart PUT. Unregistered, partially registered, and
+cross-chunk Dell transfers fail during preparation before the S3 request is
+submitted. Deregistration prevents new preparation for the range and waits for
+in-flight operations before releasing descriptors. Exact duplicate
+registrations share descriptors; partial overlaps are rejected.
 
 ## Transfer Operations
 
