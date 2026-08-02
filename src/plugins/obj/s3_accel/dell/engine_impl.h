@@ -6,9 +6,31 @@
 #ifndef NIXL_OBJ_PLUGIN_S3_DELL_ENGINE_IMPL_H
 #define NIXL_OBJ_PLUGIN_S3_DELL_ENGINE_IMPL_H
 
+#include "s3/registered_memory.h"
 #include "s3_accel/engine_impl.h"
 #include "s3_accel/dell/client.h"
 #include <cuobjclient.h>
+#include <mutex>
+
+class iDellCuObjClient {
+public:
+    virtual ~iDellCuObjClient() = default;
+
+    virtual bool
+    isConnected() const = 0;
+
+    virtual cuObjErr_t
+    getDescriptor(void *ptr, size_t size) = 0;
+
+    virtual cuObjErr_t
+    putDescriptor(void *ptr) = 0;
+
+    virtual ssize_t
+    putObject(void *ctx, void *ptr, size_t size, size_t memory_offset) = 0;
+
+    virtual ssize_t
+    getObject(void *ctx, void *ptr, size_t size, size_t memory_offset) = 0;
+};
 
 /**
  * S3 Dell ObjectScale Engine Implementation.
@@ -34,6 +56,10 @@ public:
      */
     S3DellObsObjEngineImpl(const nixlBackendInitParams *init_params,
                            std::shared_ptr<iS3Client> s3_client);
+
+    S3DellObsObjEngineImpl(const nixlBackendInitParams *init_params,
+                           std::shared_ptr<iS3Client> s3_client,
+                           std::shared_ptr<iDellCuObjClient> cu_client);
 
     /**
      * Register memory with the backend for RDMA operations.
@@ -148,7 +174,10 @@ private:
     /// S3 client for Dell ObjectScale operations
     std::shared_ptr<iS3Client> s3Client_;
     /// cuObject client for RDMA operations
-    std::shared_ptr<cuObjClient> cuClient_;
+    std::shared_ptr<iDellCuObjClient> cuClient_;
+    mutable nixl_obj_rdma::RegisteredMemoryManager registeredMemory_{CUOBJ_MAX_MEMORY_REG_SIZE - 1};
+    mutable std::mutex cuClientMutex_;
+    mutable std::mutex objectMapMutex_;
 };
 
 #endif // NIXL_OBJ_PLUGIN_S3_DELL_ENGINE_IMPL_H

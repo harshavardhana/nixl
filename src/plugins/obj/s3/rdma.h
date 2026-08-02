@@ -25,6 +25,7 @@
 // rdma_protocol.h and have no such dependency.
 
 #include "rdma_protocol.h"
+#include "registered_memory.h"
 
 #ifdef HAVE_CUOBJ_CLIENT
 
@@ -38,6 +39,46 @@
 
 namespace nixl_obj_rdma {
 
+/// Per-call context for an RDMA PUT/GET control-plane request.
+/// (region/credentials live in the control plane's signer, not here.)
+struct S3RdmaClientCtx {
+    std::string bucket;
+    std::string object;
+    std::string upload_id; // empty for single-shot (non-multipart)
+    uint32_t part_number = 0; // 1..=10000 when upload_id is set
+    std::string checksum_crc64nvme; // optional, in/out
+    std::string etag; // populated on success
+};
+
+class RdmaMemoryProvider {
+public:
+    virtual ~RdmaMemoryProvider() = default;
+
+    virtual RegisteredMemoryLease
+    acquireBuffer(const void *ptr, size_t size) const = 0;
+
+    virtual char *
+    getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op) = 0;
+
+    virtual void
+    putToken(char *token) = 0;
+};
+
+class RdmaControlPlane {
+public:
+    virtual ~RdmaControlPlane() = default;
+
+    virtual ssize_t
+    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t buf_addr, uint64_t size) = 0;
+
+    virtual ssize_t
+    rdmaGet(S3RdmaClientCtx &ctx,
+            const char *token,
+            uint64_t buf_addr,
+            uint64_t size,
+            uint64_t offset) = 0;
+};
+
 /**
  * Process-wide cuObjClient singleton.
  *
@@ -48,7 +89,7 @@ namespace nixl_obj_rdma {
  * registration (cuMemObjGetDescriptor) and token minting are serialized through
  * an internal mutex.
  */
-class SharedCuObjClient {
+class SharedCuObjClient : public RdmaMemoryProvider {
 public:
     /// Returns the process-wide instance, or nullptr if the fabric is unavailable.
     static SharedCuObjClient *
@@ -61,11 +102,18 @@ public:
 
     /// Pin a buffer for RDMA. Required before minting a token for it.
     bool
-    registerBuffer(void *ptr, size_t size);
+    registerBuffer(void *ptr,
+                   size_t size,
+                   RegisteredMemoryType memory_type,
+                   LogicalMemoryRegistration &registration);
 
     /// Release a buffer registration acquired via registerBuffer().
-    void
-    deregisterBuffer(void *ptr);
+    bool
+    deregisterBuffer(LogicalMemoryRegistration &registration);
+
+    /// Resolve and pin a complete transfer range to its registered descriptor.
+    RegisteredMemoryLease
+    acquireBuffer(const void *ptr, size_t size) const override;
 
     /// True if the pointer is CUDA device (VRAM) memory (no HTTP fallback possible).
     bool
@@ -73,9 +121,9 @@ public:
 
     /// Mint an RDMA token for a registered buffer (caller releases via putToken()).
     char *
-    getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op);
+    getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op) override;
     void
-    putToken(char *token);
+    putToken(char *token) override;
 
 private:
     SharedCuObjClient();
@@ -83,18 +131,9 @@ private:
     std::unique_ptr<cuObjClient> client_;
     bool connected_ = false;
     std::mutex mutex_;
+    RegisteredMemoryManager registeredMemory_{CUOBJ_MAX_MEMORY_REG_SIZE - 1};
 };
 
-/// Per-call context for an RDMA PUT/GET control-plane request.
-/// (region/credentials live in the control plane's signer, not here.)
-struct S3RdmaClientCtx {
-    std::string bucket;
-    std::string object;
-    std::string upload_id; // empty for single-shot (non-multipart)
-    uint32_t part_number = 0; // 1..=10000 when upload_id is set
-    std::string checksum_crc64nvme; // optional, in/out
-    std::string etag; // populated on success
-};
 
 /**
  * S3 RDMA control plane.
@@ -105,7 +144,7 @@ struct S3RdmaClientCtx {
  * low-level HTTP layer; it is deliberately narrow so the protocol logic around
  * it stays SDK-agnostic and testable.
  */
-class S3RdmaControlPlane {
+class S3RdmaControlPlane : public RdmaControlPlane {
 public:
     explicit S3RdmaControlPlane(nixl_b_params_t *custom_params);
     ~S3RdmaControlPlane();
@@ -121,7 +160,7 @@ public:
      *         server declined, or rdma_error on transport failure.
      */
     ssize_t
-    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t buf_addr, uint64_t size);
+    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t buf_addr, uint64_t size) override;
 
     /**
      * Issue the signed control-plane GET carrying the RDMA token. When
@@ -134,7 +173,7 @@ public:
             const char *token,
             uint64_t buf_addr,
             uint64_t size,
-            uint64_t offset);
+            uint64_t offset) override;
 
 private:
     struct Impl;
@@ -152,15 +191,15 @@ private:
  *         there is no HTTP fallback under accelerated=true.
  */
 ssize_t
-rdmaPutWithRetry(SharedCuObjClient &rdma,
-                 S3RdmaControlPlane &cp,
+rdmaPutWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size);
 
 ssize_t
-rdmaGetWithRetry(SharedCuObjClient &rdma,
-                 S3RdmaControlPlane &cp,
+rdmaGetWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size,

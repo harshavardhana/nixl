@@ -77,6 +77,17 @@ x-amz-rdma-token: <descriptor>:<start_addr_hex>:<size_hex>
   lowercase hex.
 - `<size_hex>` — transfer size in bytes, 16-digit lowercase hex.
 
+When a request starts inside a registered memory range, the client mints the
+opaque descriptor with the registered chunk's base pointer, that fragment's
+length, and the registration-relative offset
+`fragment_address - registered_base`. The `<start_addr_hex>` field remains the
+actual fragment data address (`registered_base + registration_relative_offset`).
+This memory offset is local to the cuObject descriptor and is completely
+independent of the S3 object offset carried by `Range`. A transfer spanning
+registered chunks is emitted as ordered token-carrying requests; GET advances
+`Range` by the bytes already transferred, while PUT uses S3 multipart upload as
+described below.
+
 Appending the per-operation start address and size to the descriptor mirrors
 cuObject's own **IO descriptor** layout (its reference server reads
 `<descriptor><rem_buf_start>…<rem_msg_size>…`); it is not an endpoint-specific
@@ -129,12 +140,30 @@ is an outcome marker the server is free to use:
 The data path's integrity is covered by RoCEv2 iCRC and, when requested, the
 `x-amz-checksum-crc64nvme` header — not by the (empty) HTTP-body content hash.
 
-## Multipart uploads
+## Multipart uploads and aggregate completion
 
-UploadPart uses the same body-less, token-carrying PUT with the standard
-`?uploadId=<id>&partNumber=<n>` query parameters (`1 ≤ n ≤ 10000`). The part's
-`ETag`/checksum are returned as usual; CompleteMultipartUpload is an ordinary
-HTTP call.
+A cross-registration PUT uses CreateMultipartUpload, followed by one ordered
+UploadPart per registered-memory fragment. UploadPart uses the same body-less,
+token-carrying PUT with the standard `?uploadId=<id>&partNumber=<n>` query
+parameters (`1 ≤ n ≤ 10000`). Each returned ETag is supplied to
+CompleteMultipartUpload, which is an ordinary signed S3 call. The single-chunk
+PUT path remains a plain PUT.
+
+The S3 multipart constraints apply: every non-final part must contain at least
+5 MiB and there can be no more than 10,000 parts. NIXL rejects an invalid
+fragment layout before creating the upload. A part is retried as a complete
+fragment, with token acquire/release symmetry on every attempt. If a part or
+completion fails, the aggregate NIXL request fails and AbortMultipartUpload is
+attempted; an abort failure is logged because cleanup is then server-side
+lifecycle-policy responsibility. The incomplete object is never completed.
+
+A fragmented GET issues ordered range requests with
+`fragment_object_offset = original_object_offset + bytes_already_done`. It
+stops at the first failed fragment and reports an aggregate error. Earlier
+fragments may already have modified their local-buffer ranges. All descriptor
+leases are held until aggregate completion, and every minted token is released.
+There is no NIXL backend cancellation callback for a running executor request;
+the sequence therefore runs until success or the first failure.
 
 ## Compliance checklist
 

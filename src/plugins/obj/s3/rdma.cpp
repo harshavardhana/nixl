@@ -74,24 +74,59 @@ SharedCuObjClient::instance() {
 }
 
 bool
-SharedCuObjClient::registerBuffer(void *ptr, size_t size) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    cuObjErr_t rc = client_->cuMemObjGetDescriptor(ptr, size);
-    if (rc != CU_OBJ_SUCCESS) {
-        NIXL_ERROR << "cuMemObjGetDescriptor failed rc=" << rc << " ptr=" << ptr
-                   << " size=" << size;
-        return false;
-    }
-    NIXL_DEBUG << "cuMemObjGetDescriptor OK ptr=" << ptr << " size=" << size;
-    return true;
+SharedCuObjClient::registerBuffer(void *ptr,
+                                  size_t size,
+                                  RegisteredMemoryType memory_type,
+                                  LogicalMemoryRegistration &registration) {
+    return registeredMemory_.registerMemory(
+        reinterpret_cast<uintptr_t>(ptr),
+        size,
+        memory_type,
+        [this](uintptr_t descriptor_base, size_t registered_length) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
+            const cuObjErr_t rc =
+                client_->cuMemObjGetDescriptor(descriptor_ptr, registered_length);
+            if (rc != CU_OBJ_SUCCESS) {
+                NIXL_ERROR << "cuMemObjGetDescriptor failed rc=" << rc
+                           << " ptr=" << descriptor_ptr << " size=" << registered_length;
+                return false;
+            }
+            NIXL_DEBUG << "cuMemObjGetDescriptor OK ptr=" << descriptor_ptr
+                       << " size=" << registered_length;
+            return true;
+        },
+        [this](uintptr_t descriptor_base) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
+            const cuObjErr_t rc = client_->cuMemObjPutDescriptor(descriptor_ptr);
+            if (rc != CU_OBJ_SUCCESS) {
+                NIXL_WARN << "cuMemObjPutDescriptor failed for ptr " << descriptor_ptr
+                          << " rc=" << rc;
+                return false;
+            }
+            return true;
+        },
+        registration);
 }
 
-void
-SharedCuObjClient::deregisterBuffer(void *ptr) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (client_->cuMemObjPutDescriptor(ptr) != CU_OBJ_SUCCESS) {
-        NIXL_WARN << "cuMemObjPutDescriptor failed for ptr " << ptr;
-    }
+bool
+SharedCuObjClient::deregisterBuffer(LogicalMemoryRegistration &registration) {
+    return registeredMemory_.deregisterMemory(registration, [this](uintptr_t descriptor_base) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        void *descriptor_ptr = reinterpret_cast<void *>(descriptor_base);
+        const cuObjErr_t rc = client_->cuMemObjPutDescriptor(descriptor_ptr);
+        if (rc != CU_OBJ_SUCCESS) {
+            NIXL_WARN << "cuMemObjPutDescriptor failed for ptr " << descriptor_ptr << " rc=" << rc;
+            return false;
+        }
+        return true;
+    });
+}
+
+RegisteredMemoryLease
+SharedCuObjClient::acquireBuffer(const void *ptr, size_t size) const {
+    return registeredMemory_.resolveAndAcquire(reinterpret_cast<uintptr_t>(ptr), size);
 }
 
 bool
@@ -463,19 +498,42 @@ S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx &ctx,
 // ---------------------------------------------------------------------------
 
 ssize_t
-rdmaPutWithRetry(SharedCuObjClient &rdma,
-                 S3RdmaControlPlane &cp,
+rdmaPutWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size) {
-    ssize_t ret = -1;
+    RegisteredMemoryLease lease = rdma.acquireBuffer(buf, size);
+    if (!lease.valid()) {
+        NIXL_ERROR << "RDMA PUT range is not contained in one registered descriptor: status="
+                   << static_cast<int>(lease.resolution().status) << " ptr=" << buf
+                   << " size=" << size;
+        return rdma_error;
+    }
+
+    const RegisteredMemoryResolution &resolution = lease.resolution();
+    void *descriptor_base = reinterpret_cast<void *>(resolution.descriptorBase);
+    const uint64_t data_address =
+        static_cast<uint64_t>(resolution.descriptorBase + resolution.registrationOffset);
+    ssize_t ret = rdma_error;
     for (int attempt = 0; attempt < rdma_max_attempts; ++attempt) {
-        char *token = rdma.getToken(buf, size, 0, CUOBJ_PUT);
+        char *token =
+            rdma.getToken(descriptor_base, size, resolution.registrationOffset, CUOBJ_PUT);
         if (token == nullptr) {
-            ret = -1;
+            ret = rdma_error;
             continue; // transient mint failure: retry
         }
-        ret = cp.rdmaPut(ctx, token, reinterpret_cast<uint64_t>(buf), size);
+        try {
+            ret = cp.rdmaPut(ctx, token, data_address, size);
+        }
+        catch (const std::exception &e) {
+            NIXL_ERROR << "RDMA PUT control-plane exception: " << e.what();
+            ret = rdma_error;
+        }
+        catch (...) {
+            NIXL_ERROR << "RDMA PUT control-plane exception";
+            ret = rdma_error;
+        }
         rdma.putToken(token);
         if (ret > 0 || ret == rdma_not_supported) {
             break;
@@ -485,20 +543,43 @@ rdmaPutWithRetry(SharedCuObjClient &rdma,
 }
 
 ssize_t
-rdmaGetWithRetry(SharedCuObjClient &rdma,
-                 S3RdmaControlPlane &cp,
+rdmaGetWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size,
                  size_t offset) {
-    ssize_t ret = -1;
+    RegisteredMemoryLease lease = rdma.acquireBuffer(buf, size);
+    if (!lease.valid()) {
+        NIXL_ERROR << "RDMA GET range is not contained in one registered descriptor: status="
+                   << static_cast<int>(lease.resolution().status) << " ptr=" << buf
+                   << " size=" << size;
+        return rdma_error;
+    }
+
+    const RegisteredMemoryResolution &resolution = lease.resolution();
+    void *descriptor_base = reinterpret_cast<void *>(resolution.descriptorBase);
+    const uint64_t data_address =
+        static_cast<uint64_t>(resolution.descriptorBase + resolution.registrationOffset);
+    ssize_t ret = rdma_error;
     for (int attempt = 0; attempt < rdma_max_attempts; ++attempt) {
-        char *token = rdma.getToken(buf, size, 0, CUOBJ_GET);
+        char *token =
+            rdma.getToken(descriptor_base, size, resolution.registrationOffset, CUOBJ_GET);
         if (token == nullptr) {
-            ret = -1;
+            ret = rdma_error;
             continue; // transient mint failure: retry
         }
-        ret = cp.rdmaGet(ctx, token, reinterpret_cast<uint64_t>(buf), size, offset);
+        try {
+            ret = cp.rdmaGet(ctx, token, data_address, size, offset);
+        }
+        catch (const std::exception &e) {
+            NIXL_ERROR << "RDMA GET control-plane exception: " << e.what();
+            ret = rdma_error;
+        }
+        catch (...) {
+            NIXL_ERROR << "RDMA GET control-plane exception";
+            ret = rdma_error;
+        }
         rdma.putToken(token);
         if (ret > 0 || ret == rdma_not_supported) {
             break;

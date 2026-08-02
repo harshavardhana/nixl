@@ -140,7 +140,8 @@ awsS3Client::putObjectAsync(std::string_view key,
                     *rdma_, *rdmaCp_, ctx, reinterpret_cast<void *>(data_ptr), data_len);
                 callback(r >= 0);
                 if (r < 0) {
-                    NIXL_ERROR << "RDMA PUT failed (accelerated enabled); no HTTP fallback";
+                    NIXL_ERROR << "RDMA PUT failed (accelerated enabled); no HTTP fallback, error "
+                               << r;
                 }
             });
             return;
@@ -191,7 +192,8 @@ awsS3Client::getObjectAsync(std::string_view key,
                     *rdma_, *rdmaCp_, ctx, reinterpret_cast<void *>(data_ptr), data_len, offset);
                 callback(r >= 0);
                 if (r < 0) {
-                    NIXL_ERROR << "RDMA GET failed (accelerated enabled); no HTTP fallback";
+                    NIXL_ERROR << "RDMA GET failed (accelerated enabled); no HTTP fallback, error "
+                               << r;
                 }
             });
             return;
