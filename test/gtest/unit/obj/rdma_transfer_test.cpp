@@ -26,30 +26,31 @@ public:
     };
 
     MockMemoryProvider(uintptr_t base, size_t length, size_t chunk_size)
-        : manager_(chunk_size) {
-        EXPECT_TRUE(manager_.registerMemory(
-            base,
-            length,
-            RegisteredMemoryType::Dram,
-            [](uintptr_t, size_t) { return true; },
-            [](uintptr_t) { return true; },
-            registration_));
+        : manager_(
+              chunk_size, [](uintptr_t, size_t) { return true; }, [](uintptr_t) { return true; }) {
+        EXPECT_TRUE(manager_.registerMemory(base, length, RegisteredMemoryType::Dram, registration_));
     }
 
     ~MockMemoryProvider() override {
         if (registration_.valid()) {
-            manager_.deregisterMemory(registration_, [](uintptr_t) { return true; });
+            manager_.deregisterMemory(registration_);
         }
     }
 
     RegisteredMemoryFragments
-    acquireBuffers(const void *ptr, size_t size) const override {
-        return manager_.resolveAndAcquireFragments(reinterpret_cast<uintptr_t>(ptr), size);
+    acquireBuffers(const void *ptr,
+                   size_t size,
+                   RegisteredMemoryType memory_type) const override {
+        return manager_.resolveAndAcquireFragments(
+            reinterpret_cast<uintptr_t>(ptr), size, memory_type);
     }
 
     RegisteredMemoryLease
-    acquireBuffer(const void *ptr, size_t size) const override {
-        return manager_.resolveAndAcquire(reinterpret_cast<uintptr_t>(ptr), size);
+    acquireBuffer(const void *ptr,
+                  size_t size,
+                  RegisteredMemoryType memory_type) const override {
+        return manager_.resolveAndAcquire(
+            reinterpret_cast<uintptr_t>(ptr), size, memory_type);
     }
 
     char *
@@ -186,7 +187,8 @@ TEST(StandardRdmaTransferTest, PutAtRegistrationBaseUsesZeroMemoryOffset) {
                                control_plane,
                                context,
                                reinterpret_cast<void *>(kBase),
-                               512),
+                               512,
+                               RegisteredMemoryType::Dram),
               512);
     ASSERT_EQ(memory.tokenCalls.size(), 1u);
     EXPECT_EQ(memory.tokenCalls[0].base, kBase);
@@ -209,7 +211,8 @@ TEST(StandardRdmaTransferTest, InteriorPutUsesBaseRelativeOffsetAndRequestedAddr
                                control_plane,
                                context,
                                reinterpret_cast<void *>(kBase + kMemoryOffset),
-                               256),
+                               256,
+                               RegisteredMemoryType::Dram),
               256);
     ASSERT_EQ(memory.tokenCalls.size(), 1u);
     EXPECT_EQ(memory.tokenCalls[0].base, kBase);
@@ -232,7 +235,8 @@ TEST(StandardRdmaTransferTest, GetKeepsObjectAndMemoryOffsetsIndependent) {
                                context,
                                reinterpret_cast<void *>(kBase + kMemoryOffset),
                                128,
-                               kObjectOffset),
+                               kObjectOffset,
+                               RegisteredMemoryType::Dram),
               128);
     ASSERT_EQ(memory.tokenCalls.size(), 1u);
     EXPECT_EQ(memory.tokenCalls[0].base, kBase);
@@ -256,7 +260,8 @@ TEST(StandardRdmaTransferTest, RejectsUnregisteredAndOverrunBeforeControlPlane) 
                                    control_plane,
                                    context,
                                    reinterpret_cast<void *>(address),
-                                   size),
+                                   size,
+                                   RegisteredMemoryType::Dram),
                   rdma_error);
         EXPECT_EQ(memory.tokenCalls.size(), token_calls_before);
         EXPECT_TRUE(control_plane.puts.empty());
@@ -275,7 +280,8 @@ TEST(StandardRdmaTransferTest, RetryReusesResolutionAndReleasesEveryMintedToken)
                                context,
                                reinterpret_cast<void *>(kBase + 64),
                                512,
-                               7),
+                               7,
+                               RegisteredMemoryType::Dram),
               512);
     ASSERT_EQ(memory.tokenCalls.size(), 2u);
     EXPECT_EQ(memory.tokenCalls[0].base, kBase);
@@ -298,7 +304,8 @@ TEST(StandardRdmaTransferTest, TokenMintFailureRetriesWithoutControlPlaneOrRelea
                                control_plane,
                                context,
                                reinterpret_cast<void *>(kBase + 8),
-                               64),
+                               64,
+                               RegisteredMemoryType::Dram),
               64);
     EXPECT_EQ(memory.tokenCalls.size(), 2u);
     EXPECT_EQ(control_plane.puts.size(), 1u);
@@ -316,7 +323,8 @@ TEST(StandardRdmaTransferTest, FragmentedGetUsesOrderedDescriptorsAndObjectOffse
                                context,
                                reinterpret_cast<void *>(kBase + 100),
                                2500,
-                               77),
+                               77,
+                               RegisteredMemoryType::Dram),
               2500);
     ASSERT_EQ(memory.tokenCalls.size(), 3u);
     EXPECT_EQ(memory.tokenCalls[0].base, kBase);
@@ -348,7 +356,8 @@ TEST(StandardRdmaTransferTest, FragmentedPutUsesMultipartAndCompletesAtomically)
                                control_plane,
                                context,
                                reinterpret_cast<void *>(kBase + kStartOffset),
-                               kSize),
+                               kSize,
+                               RegisteredMemoryType::Dram),
               static_cast<ssize_t>(kSize));
     EXPECT_EQ(control_plane.multipartBegins, 1u);
     EXPECT_EQ(control_plane.multipartCompletes, 1u);
@@ -385,7 +394,8 @@ TEST(StandardRdmaTransferTest, FragmentedPutFailureAtEveryPartAbortsAndReleasesT
                                    control_plane,
                                    context,
                                    reinterpret_cast<void *>(kBase),
-                                   2 * kChunk + 1),
+                                   2 * kChunk + 1,
+                                   RegisteredMemoryType::Dram),
                   rdma_error);
         EXPECT_EQ(control_plane.multipartBegins, 1u);
         EXPECT_EQ(control_plane.multipartCompletes, 0u);
@@ -406,7 +416,12 @@ TEST(StandardRdmaTransferTest, MultipartCompletionFailureAbortsAndReportsError) 
     context.object = "failed-completion-object";
 
     EXPECT_EQ(rdmaPutWithRetry(
-                  memory, control_plane, context, reinterpret_cast<void *>(kBase), kChunk + 1),
+                  memory,
+                  control_plane,
+                  context,
+                  reinterpret_cast<void *>(kBase),
+                  kChunk + 1,
+                  RegisteredMemoryType::Dram),
               rdma_error);
     EXPECT_EQ(control_plane.multipartBegins, 1u);
     EXPECT_EQ(control_plane.multipartCompletes, 1u);
@@ -437,7 +452,8 @@ TEST(StandardRdmaTransferTest, FragmentedGetCopiesExactBytesAcrossThreeChunks) {
                                context,
                                destination.data() + kMemoryOffset,
                                kTransferSize,
-                               kObjectOffset),
+                               kObjectOffset,
+                               RegisteredMemoryType::Dram),
               static_cast<ssize_t>(kTransferSize));
     ASSERT_EQ(control_plane.gets.size(), 3u);
     EXPECT_EQ(std::memcmp(destination.data() + kMemoryOffset,
@@ -463,7 +479,12 @@ TEST(StandardRdmaTransferTest, FragmentedPutAssemblesExactObjectAcrossThreeParts
     context.object = "byte-exact-multipart-object";
 
     EXPECT_EQ(rdmaPutWithRetry(
-                  memory, control_plane, context, source.data(), source.size()),
+                  memory,
+                  control_plane,
+                  context,
+                  source.data(),
+                  source.size(),
+                  RegisteredMemoryType::Dram),
               static_cast<ssize_t>(source.size()));
     ASSERT_EQ(control_plane.puts.size(), 3u);
     ASSERT_EQ(control_plane.object.size(), source.size());
@@ -482,11 +503,28 @@ TEST(StandardRdmaTransferTest, FragmentedPutRejectsUndersizedNonFinalS3Part) {
                                control_plane,
                                context,
                                reinterpret_cast<void *>(kBase + kChunk - 1024),
-                               2048),
+                               2048,
+                               RegisteredMemoryType::Dram),
               rdma_error);
     EXPECT_EQ(control_plane.multipartBegins, 0u);
     EXPECT_TRUE(control_plane.puts.empty());
     EXPECT_TRUE(memory.tokenCalls.empty());
+}
+
+TEST(StandardRdmaTransferTest, RejectsARegisteredAddressFromTheWrongMemoryType) {
+    MockMemoryProvider memory(kBase, 4096, 4096);
+    MockControlPlane control_plane;
+    S3RdmaClientCtx context;
+
+    EXPECT_EQ(rdmaPutWithRetry(memory,
+                               control_plane,
+                               context,
+                               reinterpret_cast<void *>(kBase),
+                               512,
+                               RegisteredMemoryType::Vram),
+              rdma_error);
+    EXPECT_TRUE(memory.tokenCalls.empty());
+    EXPECT_TRUE(control_plane.puts.empty());
 }
 
 } // namespace

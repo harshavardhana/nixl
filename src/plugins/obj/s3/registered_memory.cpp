@@ -29,21 +29,23 @@ RegisteredMemoryRegistry::checkInsertLocked(const RegisteredMemoryRange &range) 
         return RangeInsertResult::InvalidRange;
     }
 
-    auto next = ranges_.lower_bound(range.descriptorBase);
-    if (next != ranges_.end() && next->first == range.descriptorBase) {
-        if (next->second.range.length == range.length &&
-            next->second.range.memoryType == range.memoryType) {
+    const RegisteredMemoryKey key{range.memoryType, range.descriptorBase};
+    auto next = ranges_.lower_bound(key);
+    if (next != ranges_.end() && next->first == key) {
+        if (next->second.range.length == range.length) {
             return RangeInsertResult::Duplicate;
         }
         return RangeInsertResult::Overlap;
     }
 
-    if (next != ranges_.end() && next->first <= last_address) {
+    if (next != ranges_.end() && next->first.first == range.memoryType &&
+        next->first.second <= last_address) {
         return RangeInsertResult::Overlap;
     }
     if (next != ranges_.begin()) {
         const auto previous = std::prev(next);
-        if (previous->second.lastAddress >= range.descriptorBase) {
+        if (previous->first.first == range.memoryType &&
+            previous->second.lastAddress >= range.descriptorBase) {
             return RangeInsertResult::Overlap;
         }
     }
@@ -63,12 +65,12 @@ RegisteredMemoryRegistry::insert(const RegisteredMemoryRange &range, uint64_t ow
     if (result == RangeInsertResult::Inserted) {
         uintptr_t last_address = 0;
         getLastAddress(range.descriptorBase, range.length, last_address);
-        ranges_.emplace(range.descriptorBase,
+        ranges_.emplace(RegisteredMemoryKey{range.memoryType, range.descriptorBase},
                         Entry{range, last_address, std::unordered_set<uint64_t>{owner_id}});
         return result;
     }
     if (result == RangeInsertResult::Duplicate) {
-        auto &owners = ranges_.at(range.descriptorBase).owners;
+        auto &owners = ranges_.at({range.memoryType, range.descriptorBase}).owners;
         if (!owners.insert(owner_id).second) {
             return RangeInsertResult::DuplicateOwner;
         }
@@ -79,9 +81,8 @@ RegisteredMemoryRegistry::insert(const RegisteredMemoryRange &range, uint64_t ow
 RangeRemoveResult
 RegisteredMemoryRegistry::remove(const RegisteredMemoryRange &range, uint64_t owner_id) {
     const std::lock_guard<std::mutex> lock(mutex_);
-    auto it = ranges_.find(range.descriptorBase);
-    if (it == ranges_.end() || it->second.range.length != range.length ||
-        it->second.range.memoryType != range.memoryType) {
+    auto it = ranges_.find({range.memoryType, range.descriptorBase});
+    if (it == ranges_.end() || it->second.range.length != range.length) {
         return RangeRemoveResult::NotFound;
     }
     if (it->second.owners.erase(owner_id) == 0) {
@@ -95,7 +96,9 @@ RegisteredMemoryRegistry::remove(const RegisteredMemoryRange &range, uint64_t ow
 }
 
 RegisteredMemoryResolution
-RegisteredMemoryRegistry::resolve(uintptr_t request_addr, size_t request_len) const {
+RegisteredMemoryRegistry::resolve(uintptr_t request_addr,
+                                  size_t request_len,
+                                  RegisteredMemoryType memory_type) const {
     if (request_len == 0) {
         return {RangeResolveStatus::ZeroLength};
     }
@@ -106,13 +109,14 @@ RegisteredMemoryRegistry::resolve(uintptr_t request_addr, size_t request_len) co
     }
 
     const std::lock_guard<std::mutex> lock(mutex_);
-    auto next = ranges_.upper_bound(request_addr);
+    auto next = ranges_.upper_bound({memory_type, request_addr});
     if (next == ranges_.begin()) {
         return {RangeResolveStatus::NotFound};
     }
 
     auto containing_start = std::prev(next);
-    if (request_addr > containing_start->second.lastAddress) {
+    if (containing_start->first.first != memory_type ||
+        request_addr > containing_start->second.lastAddress) {
         return {RangeResolveStatus::NotFound};
     }
 
@@ -132,8 +136,9 @@ RegisteredMemoryRegistry::resolve(uintptr_t request_addr, size_t request_len) co
     // stable cross-registration result for the former.
     auto current = std::next(containing_start);
     uintptr_t covered_last = entry.lastAddress;
-    while (current != ranges_.end() && covered_last != std::numeric_limits<uintptr_t>::max() &&
-           current->first == covered_last + 1) {
+    while (current != ranges_.end() && current->first.first == memory_type &&
+           covered_last != std::numeric_limits<uintptr_t>::max() &&
+           current->first.second == covered_last + 1) {
         covered_last = current->second.lastAddress;
         if (request_last <= covered_last) {
             return {RangeResolveStatus::CrossRegistration};
@@ -145,7 +150,8 @@ RegisteredMemoryRegistry::resolve(uintptr_t request_addr, size_t request_len) co
 
 RegisteredMemoryFragments
 RegisteredMemoryManager::resolveAndAcquireFragments(uintptr_t request_addr,
-                                                    size_t request_len) const {
+                                                    size_t request_len,
+                                                    RegisteredMemoryType memory_type) const {
     RegisteredMemoryFragments fragments;
     if (request_len == 0) {
         fragments.status = RangeResolveStatus::ZeroLength;
@@ -160,14 +166,14 @@ RegisteredMemoryManager::resolveAndAcquireFragments(uintptr_t request_addr,
     uintptr_t current = request_addr;
     size_t remaining = request_len;
     while (remaining != 0) {
-        const RegisteredMemoryResolution resolution = registry_.resolve(current, 1);
+        const RegisteredMemoryResolution resolution = registry_.resolve(current, 1, memory_type);
         if (resolution.status != RangeResolveStatus::Resolved) {
             fragments.leases.clear();
             fragments.status = resolution.status;
             return fragments;
         }
 
-        auto lifetime = lifetimes_.find(resolution.descriptorBase);
+        auto lifetime = lifetimes_.find({memory_type, resolution.descriptorBase});
         if (lifetime == lifetimes_.end()) {
             fragments.leases.clear();
             fragments.status = RangeResolveStatus::NotFound;
@@ -227,8 +233,12 @@ RegisteredMemoryRegistry::size() const {
     return ranges_.size();
 }
 
-RegisteredMemoryManager::RegisteredMemoryManager(size_t max_registration_size)
-    : maxRegistrationSize_(max_registration_size) {}
+RegisteredMemoryManager::RegisteredMemoryManager(size_t max_registration_size,
+                                                 AcquireDescriptor acquire_descriptor,
+                                                 ReleaseDescriptor release_descriptor)
+    : maxRegistrationSize_(max_registration_size),
+      acquireDescriptor_(std::move(acquire_descriptor)),
+      releaseDescriptor_(std::move(release_descriptor)) {}
 
 RegisteredMemoryManager::LeaseToken::~LeaseToken() {
     const std::lock_guard<std::mutex> lock(lifetime->mutex);
@@ -275,16 +285,20 @@ RegisteredMemoryManager::overlapsRetiringRange(const RegisteredMemoryRange &rang
     }
     const uintptr_t range_last = range.descriptorBase + range.length - 1;
 
-    auto next = retiringRanges_.lower_bound(range.descriptorBase);
-    if (next != retiringRanges_.end() && next->first <= range_last) {
+    const RegisteredMemoryKey key{range.memoryType, range.descriptorBase};
+    auto next = retiringRanges_.lower_bound(key);
+    if (next != retiringRanges_.end() && next->first.first == range.memoryType &&
+        next->first.second <= range_last) {
         return true;
     }
     if (next != retiringRanges_.begin()) {
         const auto previous = std::prev(next);
-        const uintptr_t previous_last =
-            previous->second.descriptorBase + previous->second.length - 1;
-        if (previous_last >= range.descriptorBase) {
-            return true;
+        if (previous->first.first == range.memoryType) {
+            const uintptr_t previous_last =
+                previous->second.descriptorBase + previous->second.length - 1;
+            if (previous_last >= range.descriptorBase) {
+                return true;
+            }
         }
     }
     return false;
@@ -294,233 +308,130 @@ bool
 RegisteredMemoryManager::registerMemory(uintptr_t base,
                                         size_t length,
                                         RegisteredMemoryType memory_type,
-                                        const AcquireDescriptor &acquire_descriptor,
-                                        const ReleaseDescriptor &release_descriptor,
                                         LogicalMemoryRegistration &registration) {
     registration = {};
-    const char *memory_type_name = memory_type == RegisteredMemoryType::Vram ? "VRAM" : "DRAM";
-    NIXL_INFO << "registerMemory: request base=" << reinterpret_cast<void *>(base)
-              << " length=" << length << " memory_type=" << memory_type_name
+    NIXL_INFO << "registerMemory: base=" << reinterpret_cast<void *>(base) << " length=" << length
               << " max_chunk_size=" << maxRegistrationSize_;
 
-    if (!acquire_descriptor || !release_descriptor) {
-        NIXL_ERROR << "registerMemory: descriptor callback missing"
-                   << " acquire=" << static_cast<bool>(acquire_descriptor)
-                   << " release=" << static_cast<bool>(release_descriptor);
+    if (!acquireDescriptor_ || !releaseDescriptor_) {
+        NIXL_ERROR << "registerMemory: descriptor callback missing";
         return false;
     }
 
     std::vector<RegisteredMemoryRange> chunks;
     if (!makeChunks(base, length, memory_type, chunks)) {
-        NIXL_ERROR << "registerMemory: cannot chunk invalid range"
-                   << " base=" << reinterpret_cast<void *>(base) << " length=" << length
-                   << " max_chunk_size=" << maxRegistrationSize_;
+        NIXL_ERROR << "registerMemory: cannot chunk range"
+                   << " base=" << reinterpret_cast<void *>(base) << " length=" << length;
         return false;
-    }
-
-    NIXL_INFO << "registerMemory: generated " << chunks.size() << " chunk(s)";
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        const auto &chunk = chunks[i];
-        NIXL_INFO << "registerMemory: planned chunk=" << (i + 1) << "/" << chunks.size()
-                  << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                  << " last=" << reinterpret_cast<void *>(chunk.descriptorBase + chunk.length - 1)
-                  << " length=" << chunk.length << " memory_type=" << memory_type_name;
     }
 
     const std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<bool> needs_descriptor;
-    needs_descriptor.reserve(chunks.size());
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        const auto &chunk = chunks[i];
-        if (overlapsRetiringRange(chunk)) {
-            NIXL_ERROR << "registerMemory: planned chunk overlaps a retiring registration"
-                       << " chunk=" << (i + 1) << "/" << chunks.size()
-                       << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                       << " length=" << chunk.length;
-            return false;
-        }
-        const RangeInsertResult result = registry_.checkInsert(chunk);
-        const char *registry_state = result == RangeInsertResult::Inserted ? "new" :
-            result == RangeInsertResult::Duplicate                         ? "duplicate" :
-                                                                             "rejected";
-        NIXL_INFO << "registerMemory: checked chunk=" << (i + 1) << "/" << chunks.size()
-                  << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                  << " length=" << chunk.length << " registry_state=" << registry_state;
-        if (result != RangeInsertResult::Inserted && result != RangeInsertResult::Duplicate) {
-            NIXL_ERROR << "registerMemory: chunk rejected by registry"
-                       << " chunk=" << (i + 1) << "/" << chunks.size()
-                       << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                       << " length=" << chunk.length
-                       << " insert_result=" << static_cast<int>(result);
-            return false;
-        }
-        needs_descriptor.push_back(result == RangeInsertResult::Inserted);
-    }
-
-    std::vector<uintptr_t> acquired;
-    acquired.reserve(chunks.size());
-    bool acquisition_succeeded = true;
-    size_t failed_chunk_index = chunks.size();
-    try {
-        for (size_t i = 0; i < chunks.size(); ++i) {
-            if (!needs_descriptor[i]) {
-                NIXL_INFO << "registerMemory: reusing descriptor"
-                          << " chunk=" << (i + 1) << "/" << chunks.size()
-                          << " base=" << reinterpret_cast<void *>(chunks[i].descriptorBase)
-                          << " length=" << chunks[i].length;
-                continue;
-            }
-            NIXL_INFO << "registerMemory: acquiring descriptor"
-                      << " chunk=" << (i + 1) << "/" << chunks.size()
-                      << " base=" << reinterpret_cast<void *>(chunks[i].descriptorBase)
-                      << " length=" << chunks[i].length;
-            if (!acquire_descriptor(chunks[i].descriptorBase, chunks[i].length)) {
-                NIXL_ERROR << "registerMemory: descriptor acquisition failed"
-                           << " chunk=" << (i + 1) << "/" << chunks.size()
-                           << " base=" << reinterpret_cast<void *>(chunks[i].descriptorBase)
-                           << " length=" << chunks[i].length;
-                failed_chunk_index = i;
-                acquisition_succeeded = false;
-                break;
-            }
-            acquired.push_back(chunks[i].descriptorBase);
-            NIXL_INFO << "registerMemory: descriptor acquired"
-                      << " chunk=" << (i + 1) << "/" << chunks.size()
-                      << " base=" << reinterpret_cast<void *>(chunks[i].descriptorBase)
-                      << " length=" << chunks[i].length;
-        }
-    }
-    catch (...) {
-        NIXL_ERROR << "registerMemory: descriptor acquisition threw an exception";
-        acquisition_succeeded = false;
-    }
-    if (!acquisition_succeeded) {
-        NIXL_ERROR << "registerMemory: acquisition failure dump"
-                   << " request_base=" << reinterpret_cast<void *>(base)
-                   << " request_length=" << length << " memory_type=" << memory_type_name
-                   << " chunks=" << chunks.size() << " failed_chunk="
-                   << (failed_chunk_index < chunks.size() ? failed_chunk_index + 1 : 0);
-        for (size_t i = 0; i < chunks.size(); ++i) {
-            const auto &chunk = chunks[i];
-            const bool was_acquired =
-                std::find(acquired.begin(), acquired.end(), chunk.descriptorBase) != acquired.end();
-            const char *descriptor_state = !needs_descriptor[i] ? "reused" :
-                was_acquired                                    ? "acquired" :
-                i == failed_chunk_index                         ? "failed" :
-                                                                  "not-attempted";
-            NIXL_ERROR << "registerMemory: failure chunk=" << (i + 1) << "/" << chunks.size()
-                       << " base=" << reinterpret_cast<void *>(chunk.descriptorBase) << " last="
-                       << reinterpret_cast<void *>(chunk.descriptorBase + chunk.length - 1)
-                       << " length=" << chunk.length << " descriptor_state=" << descriptor_state;
-        }
-        NIXL_INFO << "registerMemory: rolling back " << acquired.size()
-                  << " acquired descriptor(s)";
-        for (auto it = acquired.rbegin(); it != acquired.rend(); ++it) {
-            try {
-                NIXL_INFO << "registerMemory: releasing descriptor during rollback"
-                          << " base=" << reinterpret_cast<void *>(*it);
-                release_descriptor(*it);
-            }
-            catch (...) {
-            }
-        }
-        return false;
-    }
-
-    std::vector<std::shared_ptr<DescriptorLifetime>> new_lifetimes(chunks.size());
-    try {
-        for (size_t i = 0; i < chunks.size(); ++i) {
-            if (needs_descriptor[i]) {
-                new_lifetimes[i] = std::make_shared<DescriptorLifetime>();
-            }
-        }
-    }
-    catch (...) {
-        for (auto it = acquired.rbegin(); it != acquired.rend(); ++it) {
-            try {
-                release_descriptor(*it);
-            }
-            catch (...) {
-            }
-        }
-        return false;
-    }
-
     uint64_t owner_id = nextOwnerId_++;
     if (owner_id == 0) {
         owner_id = nextOwnerId_++;
     }
 
-    std::vector<RegisteredMemoryRange> committed;
-    committed.reserve(chunks.size());
-    bool publication_succeeded = true;
-    try {
-        for (size_t i = 0; i < chunks.size(); ++i) {
-            const auto &chunk = chunks[i];
-            const RangeInsertResult result = registry_.insert(chunk, owner_id);
-            if (result != RangeInsertResult::Inserted && result != RangeInsertResult::Duplicate) {
-                NIXL_ERROR << "registerMemory: failed to publish chunk"
-                           << " owner_id=" << owner_id << " chunk=" << (i + 1) << "/"
-                           << chunks.size()
-                           << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                           << " length=" << chunk.length
-                           << " insert_result=" << static_cast<int>(result);
-                publication_succeeded = false;
-                break;
+    struct CompletedChunk {
+        RegisteredMemoryRange range;
+        bool acquiredDescriptor;
+    };
+
+    std::vector<CompletedChunk> completed;
+    completed.reserve(chunks.size());
+
+    auto rollback = [&]() {
+        NIXL_INFO << "registerMemory: rolling back " << completed.size() << " chunk(s)";
+        for (auto it = completed.rbegin(); it != completed.rend(); ++it) {
+            if (registry_.remove(it->range, owner_id) == RangeRemoveResult::Removed) {
+                lifetimes_.erase({it->range.memoryType, it->range.descriptorBase});
             }
-            committed.push_back(chunk);
-            NIXL_INFO << "registerMemory: published chunk"
-                      << " owner_id=" << owner_id << " chunk=" << (i + 1) << "/" << chunks.size()
-                      << " base=" << reinterpret_cast<void *>(chunk.descriptorBase)
-                      << " length=" << chunk.length << " registry_state="
-                      << (result == RangeInsertResult::Inserted ? "new" : "duplicate");
-            if (result == RangeInsertResult::Inserted) {
-                lifetimes_.emplace(chunk.descriptorBase, std::move(new_lifetimes[i]));
-            } else if (lifetimes_.find(chunk.descriptorBase) == lifetimes_.end()) {
-                NIXL_ERROR << "registerMemory: duplicate chunk has no descriptor lifetime"
-                           << " owner_id=" << owner_id
-                           << " base=" << reinterpret_cast<void *>(chunk.descriptorBase);
-                publication_succeeded = false;
-                break;
+            if (it->acquiredDescriptor) {
+                try {
+                    releaseDescriptor_(it->range.descriptorBase);
+                }
+                catch (...) {
+                }
             }
         }
-    }
-    catch (...) {
-        NIXL_ERROR << "registerMemory: publication threw an exception";
-        publication_succeeded = false;
-    }
-    if (!publication_succeeded) {
-        NIXL_INFO << "registerMemory: rolling back publication"
-                  << " owner_id=" << owner_id << " committed_chunks=" << committed.size()
-                  << " acquired_descriptors=" << acquired.size();
-        for (auto it = committed.rbegin(); it != committed.rend(); ++it) {
-            if (registry_.remove(*it, owner_id) == RangeRemoveResult::Removed) {
-                lifetimes_.erase(it->descriptorBase);
-            }
+    };
+
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const auto &chunk = chunks[i];
+
+        if (overlapsRetiringRange(chunk)) {
+            NIXL_ERROR << "registerMemory: chunk " << (i + 1) << "/" << chunks.size()
+                       << " overlaps a retiring registration";
+            rollback();
+            return false;
         }
-        for (auto it = acquired.rbegin(); it != acquired.rend(); ++it) {
+
+        const RangeInsertResult check = registry_.checkInsert(chunk);
+        if (check != RangeInsertResult::Inserted && check != RangeInsertResult::Duplicate) {
+            NIXL_ERROR << "registerMemory: chunk " << (i + 1) << "/" << chunks.size()
+                       << " rejected by registry";
+            rollback();
+            return false;
+        }
+
+        bool acquired = false;
+        if (check == RangeInsertResult::Inserted) {
+            if (!acquireDescriptor_(chunk.descriptorBase, chunk.length)) {
+                NIXL_ERROR << "registerMemory: descriptor acquisition failed for chunk " << (i + 1)
+                           << "/" << chunks.size();
+                rollback();
+                return false;
+            }
+            acquired = true;
+        }
+
+        const RangeInsertResult result = registry_.insert(chunk, owner_id);
+        if (result == RangeInsertResult::Inserted) {
             try {
-                release_descriptor(*it);
+                lifetimes_.emplace(RegisteredMemoryKey{chunk.memoryType, chunk.descriptorBase},
+                                   std::make_shared<DescriptorLifetime>());
             }
             catch (...) {
+                registry_.remove(chunk, owner_id);
+                try {
+                    releaseDescriptor_(chunk.descriptorBase);
+                }
+                catch (...) {
+                }
+                rollback();
+                return false;
             }
+        } else if (result == RangeInsertResult::Duplicate) {
+            if (lifetimes_.find({chunk.memoryType, chunk.descriptorBase}) == lifetimes_.end()) {
+                NIXL_ERROR << "registerMemory: duplicate chunk has no lifetime";
+                registry_.remove(chunk, owner_id);
+                rollback();
+                return false;
+            }
+        } else {
+            if (acquired) {
+                try {
+                    releaseDescriptor_(chunk.descriptorBase);
+                }
+                catch (...) {
+                }
+            }
+            rollback();
+            return false;
         }
-        return false;
+
+        completed.push_back({chunk, acquired});
     }
 
     registration.ownerId = owner_id;
     registration.chunks = std::move(chunks);
-    NIXL_INFO << "registerMemory: registration complete"
-              << " owner_id=" << registration.ownerId << " base=" << reinterpret_cast<void *>(base)
-              << " length=" << length << " chunks=" << registration.chunks.size()
-              << " newly_acquired_descriptors=" << acquired.size();
+    NIXL_INFO << "registerMemory: complete"
+              << " owner_id=" << owner_id << " chunks=" << registration.chunks.size();
     return true;
 }
 
 bool
-RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registration,
-                                          const ReleaseDescriptor &release_descriptor) {
-    if (!registration.valid() || !release_descriptor) {
+RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registration) {
+    if (!registration.valid() || !releaseDescriptor_) {
         return false;
     }
 
@@ -537,7 +448,7 @@ RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registratio
     for (const auto &chunk : registration.chunks) {
         const RangeRemoveResult result = registry_.remove(chunk, registration.ownerId);
         if (result == RangeRemoveResult::Removed) {
-            auto lifetime = lifetimes_.find(chunk.descriptorBase);
+            auto lifetime = lifetimes_.find({chunk.memoryType, chunk.descriptorBase});
             if (lifetime == lifetimes_.end()) {
                 success = false;
                 continue;
@@ -546,7 +457,8 @@ RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registratio
                 const std::lock_guard<std::mutex> lifetime_lock(lifetime->second->mutex);
                 lifetime->second->retiring = true;
             }
-            retiringRanges_.emplace(chunk.descriptorBase, chunk);
+            retiringRanges_.emplace(
+                RegisteredMemoryKey{chunk.memoryType, chunk.descriptorBase}, chunk);
             descriptors_to_release.push_back({chunk, lifetime->second});
         } else if (result != RangeRemoveResult::Retained) {
             success = false;
@@ -565,7 +477,7 @@ RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registratio
 
     for (const auto &pending : descriptors_to_release) {
         try {
-            if (!release_descriptor(pending.range.descriptorBase)) {
+            if (!releaseDescriptor_(pending.range.descriptorBase)) {
                 success = false;
             }
         }
@@ -576,30 +488,37 @@ RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registratio
 
     lock.lock();
     for (const auto &pending : descriptors_to_release) {
-        auto lifetime = lifetimes_.find(pending.range.descriptorBase);
+        auto lifetime = lifetimes_.find(
+            {pending.range.memoryType, pending.range.descriptorBase});
         if (lifetime != lifetimes_.end() && lifetime->second == pending.lifetime) {
             lifetimes_.erase(lifetime);
         }
-        retiringRanges_.erase(pending.range.descriptorBase);
+        retiringRanges_.erase(
+            {pending.range.memoryType, pending.range.descriptorBase});
     }
     return success;
 }
 
 RegisteredMemoryResolution
-RegisteredMemoryManager::resolve(uintptr_t request_addr, size_t request_len) const {
+RegisteredMemoryManager::resolve(uintptr_t request_addr,
+                                 size_t request_len,
+                                 RegisteredMemoryType memory_type) const {
     const std::lock_guard<std::mutex> lock(mutex_);
-    return registry_.resolve(request_addr, request_len);
+    return registry_.resolve(request_addr, request_len, memory_type);
 }
 
 RegisteredMemoryLease
-RegisteredMemoryManager::resolveAndAcquire(uintptr_t request_addr, size_t request_len) const {
+RegisteredMemoryManager::resolveAndAcquire(uintptr_t request_addr,
+                                           size_t request_len,
+                                           RegisteredMemoryType memory_type) const {
     const std::lock_guard<std::mutex> lock(mutex_);
-    const RegisteredMemoryResolution resolution = registry_.resolve(request_addr, request_len);
+    const RegisteredMemoryResolution resolution =
+        registry_.resolve(request_addr, request_len, memory_type);
     if (resolution.status != RangeResolveStatus::Resolved) {
         return RegisteredMemoryLease(resolution, {});
     }
 
-    auto lifetime = lifetimes_.find(resolution.descriptorBase);
+    auto lifetime = lifetimes_.find({memory_type, resolution.descriptorBase});
     if (lifetime == lifetimes_.end()) {
         return RegisteredMemoryLease({RangeResolveStatus::NotFound}, {});
     }

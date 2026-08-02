@@ -74,7 +74,9 @@ awsS3CrtClient::putObjectAsync(std::string_view key,
                                uintptr_t data_ptr,
                                size_t data_len,
                                size_t offset,
+                               nixl_mem_t memory_type,
                                put_object_callback_t callback) {
+    (void)memory_type;
     if (offset != 0) {
         callback(false);
         return;
@@ -113,7 +115,9 @@ awsS3CrtClient::getObjectAsync(std::string_view key,
                                uintptr_t data_ptr,
                                size_t data_len,
                                size_t offset,
+                               nixl_mem_t memory_type,
                                get_object_callback_t callback) {
+    (void)memory_type;
     auto preallocated_stream_buf = Aws::MakeShared<Aws::Utils::Stream::PreallocatedStreamBuf>(
         "GetObjectStreamBuf", reinterpret_cast<unsigned char *>(data_ptr), data_len);
     auto stream_factory = Aws::MakeShared<Aws::IOStreamFactory>(

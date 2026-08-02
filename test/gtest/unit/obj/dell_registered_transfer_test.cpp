@@ -137,8 +137,9 @@ protected:
             size_t size,
             size_t object_offset,
             uint64_t object_dev_id,
-            nixlBackendReqH *&handle) {
-        nixl_meta_dlist_t local(DRAM_SEG);
+            nixlBackendReqH *&handle,
+            nixl_mem_t memory_type = DRAM_SEG) {
+        nixl_meta_dlist_t local(memory_type);
         nixl_meta_dlist_t remote(OBJ_SEG);
         local.addDesc(nixlMetaDesc(address, size, 1));
         remote.addDesc(nixlMetaDesc(object_offset, size, object_dev_id));
@@ -206,12 +207,71 @@ TEST_F(DellRegisteredTransferTest, InteriorGetUsesDescriptorBaseAndMemoryOffset)
     nixlBackendMD *object_metadata = registerObject();
 
     nixlBackendReqH *handle = nullptr;
-    ASSERT_EQ(prepare(NIXL_READ, kBase + 511, 64, 9001, 2, handle), NIXL_SUCCESS);
+    ASSERT_EQ(prepare(NIXL_READ, kBase + 511, 64, 9001, 2, handle, VRAM_SEG),
+              NIXL_SUCCESS);
     ASSERT_EQ(cu_->gets.size(), 1u);
     EXPECT_EQ(cu_->gets[0].base, kBase);
     EXPECT_EQ(cu_->gets[0].memoryOffset, 511u);
 
     EXPECT_EQ(engine_->releaseReqH(handle), NIXL_SUCCESS);
+    EXPECT_EQ(engine_->deregisterMem(memory_metadata), NIXL_SUCCESS);
+    EXPECT_EQ(engine_->deregisterMem(object_metadata), NIXL_SUCCESS);
+}
+
+TEST_F(DellRegisteredTransferTest, SameNumericDramAndVramRangesResolveIndependently) {
+    nixlBlobDesc memory = {};
+    memory.addr = kBase;
+    memory.len = 4096;
+    nixlBackendMD *dram_metadata = nullptr;
+    nixlBackendMD *vram_metadata = nullptr;
+    ASSERT_EQ(engine_->registerMem(memory, DRAM_SEG, dram_metadata), NIXL_SUCCESS);
+    ASSERT_EQ(engine_->registerMem(memory, VRAM_SEG, vram_metadata), NIXL_SUCCESS);
+    ASSERT_EQ(cu_->registrations.size(), 2u);
+    nixlBackendMD *object_metadata = registerObject();
+
+    nixlBackendReqH *dram_handle = nullptr;
+    ASSERT_EQ(prepare(NIXL_WRITE, kBase + 32, 64, 0, 2, dram_handle, DRAM_SEG),
+              NIXL_SUCCESS);
+    ASSERT_EQ(cu_->puts.size(), 1u);
+    EXPECT_EQ(cu_->puts.back().base, kBase);
+    EXPECT_EQ(cu_->puts.back().memoryOffset, 32u);
+    EXPECT_EQ(engine_->releaseReqH(dram_handle), NIXL_SUCCESS);
+
+    nixlBackendReqH *vram_handle = nullptr;
+    ASSERT_EQ(prepare(NIXL_READ, kBase + 96, 64, 0, 2, vram_handle, VRAM_SEG),
+              NIXL_SUCCESS);
+    ASSERT_EQ(cu_->gets.size(), 1u);
+    EXPECT_EQ(cu_->gets.back().base, kBase);
+    EXPECT_EQ(cu_->gets.back().memoryOffset, 96u);
+    EXPECT_EQ(engine_->releaseReqH(vram_handle), NIXL_SUCCESS);
+
+    EXPECT_EQ(engine_->deregisterMem(dram_metadata), NIXL_SUCCESS);
+    EXPECT_EQ(cu_->releaseCount.load(), 1u);
+
+    nixlBackendReqH *remaining_vram_handle = nullptr;
+    ASSERT_EQ(prepare(
+                  NIXL_READ, kBase, 64, 0, 2, remaining_vram_handle, VRAM_SEG),
+              NIXL_SUCCESS);
+    EXPECT_EQ(engine_->releaseReqH(remaining_vram_handle), NIXL_SUCCESS);
+
+    EXPECT_EQ(engine_->deregisterMem(vram_metadata), NIXL_SUCCESS);
+    EXPECT_EQ(cu_->releaseCount.load(), 2u);
+    EXPECT_EQ(engine_->deregisterMem(object_metadata), NIXL_SUCCESS);
+}
+
+TEST_F(DellRegisteredTransferTest, RejectsLookupUsingTheWrongMemoryType) {
+    nixlBlobDesc memory = {};
+    memory.addr = kBase;
+    memory.len = 4096;
+    nixlBackendMD *memory_metadata = nullptr;
+    ASSERT_EQ(engine_->registerMem(memory, DRAM_SEG, memory_metadata), NIXL_SUCCESS);
+    nixlBackendMD *object_metadata = registerObject();
+
+    nixlBackendReqH *handle = nullptr;
+    EXPECT_EQ(prepare(NIXL_READ, kBase, 64, 0, 2, handle, VRAM_SEG), NIXL_ERR_BACKEND);
+    EXPECT_EQ(handle, nullptr);
+    EXPECT_TRUE(cu_->gets.empty());
+
     EXPECT_EQ(engine_->deregisterMem(memory_metadata), NIXL_SUCCESS);
     EXPECT_EQ(engine_->deregisterMem(object_metadata), NIXL_SUCCESS);
 }

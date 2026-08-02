@@ -138,7 +138,9 @@ The Dell ObjectScale engine supports the following memory types:
 - `VRAM_SEG` - GPU memory segment
 
 DRAM and VRAM use the same transactional range registry as the standard S3
-accelerated engine. Logical registrations larger than
+accelerated engine, but are tracked as independent address spaces. Identical
+numeric DRAM and VRAM ranges may coexist, and transfers resolve only against
+the local descriptor's memory type. Logical registrations larger than
 `CUOBJ_MAX_MEMORY_REG_SIZE` are split into adjacent cuObject-sized chunks. An
 interior transfer is prepared with the owning chunk's registered base pointer
 and the registration-relative memory offset; the remote object's offset remains

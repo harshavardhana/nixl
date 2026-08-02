@@ -367,6 +367,7 @@ DefaultObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
         uintptr_t data_ptr = local_desc.addr;
         size_t data_len = local_desc.len;
         size_t offset = remote_desc.addr;
+        const nixl_mem_t memory_type = local.getType();
 
         iS3Client *client = getClientForSize(data_len);
         if (!client) {
@@ -382,10 +383,20 @@ DefaultObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
 
         if (operation == NIXL_WRITE) {
             client->putObjectAsync(
-                obj_key_search->second, data_ptr, data_len, offset, status_callback);
+                obj_key_search->second,
+                data_ptr,
+                data_len,
+                offset,
+                memory_type,
+                status_callback);
         } else {
             client->getObjectAsync(
-                obj_key_search->second, data_ptr, data_len, offset, status_callback);
+                obj_key_search->second,
+                data_ptr,
+                data_len,
+                offset,
+                memory_type,
+                status_callback);
         }
     }
 

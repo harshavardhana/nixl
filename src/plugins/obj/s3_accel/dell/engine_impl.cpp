@@ -421,6 +421,29 @@ S3DellObsObjEngineImpl::S3DellObsObjEngineImpl(
     }
 }
 
+bool
+S3DellObsObjEngineImpl::acquireDescriptor(uintptr_t descriptor_base, size_t registered_length) {
+    const std::lock_guard<std::mutex> lock(cuClientMutex_);
+    const cuObjErr_t status =
+        cuClient_->getDescriptor(reinterpret_cast<void *>(descriptor_base), registered_length);
+    if (status != CU_OBJ_SUCCESS) {
+        NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << status;
+        return false;
+    }
+    return true;
+}
+
+bool
+S3DellObsObjEngineImpl::releaseDescriptor(uintptr_t descriptor_base) {
+    const std::lock_guard<std::mutex> lock(cuClientMutex_);
+    const cuObjErr_t status = cuClient_->putDescriptor(reinterpret_cast<void *>(descriptor_base));
+    if (status != CU_OBJ_SUCCESS) {
+        NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << status;
+        return false;
+    }
+    return true;
+}
+
 /**
  * Register memory with the backend for RDMA operations.
  * Supports OBJ_SEG, DRAM_SEG, and VRAM_SEG memory types.
@@ -465,32 +488,9 @@ S3DellObsObjEngineImpl::registerMem(const nixlBlobDesc &mem,
     const auto memory_type = nixl_mem == VRAM_SEG
                                  ? nixl_obj_rdma::RegisteredMemoryType::Vram
                                  : nixl_obj_rdma::RegisteredMemoryType::Dram;
-    const auto release_descriptor = [this](uintptr_t descriptor_base) {
-        const std::lock_guard<std::mutex> lock(cuClientMutex_);
-        const cuObjErr_t status =
-            cuClient_->putDescriptor(reinterpret_cast<void *>(descriptor_base));
-        if (status != CU_OBJ_SUCCESS) {
-            NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << status;
-            return false;
-        }
-        return true;
-    };
-    const bool registered = registeredMemory_.registerMemory(
-        mem.addr,
-        mem.len,
-        memory_type,
-        [this](uintptr_t descriptor_base, size_t length) {
-            const std::lock_guard<std::mutex> lock(cuClientMutex_);
-            const cuObjErr_t status =
-                cuClient_->getDescriptor(reinterpret_cast<void *>(descriptor_base), length);
-            if (status != CU_OBJ_SUCCESS) {
-                NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << status;
-                return false;
-            }
-            return true;
-        },
-        release_descriptor,
-        registration);
+
+    const bool registered =
+        registeredMemory_.registerMemory(mem.addr, mem.len, memory_type, registration);
     if (!registered) {
         NIXL_ERROR << "Transactional cuObject memory registration failed";
         return NIXL_ERR_BACKEND;
@@ -500,7 +500,7 @@ S3DellObsObjEngineImpl::registerMem(const nixlBlobDesc &mem,
         out = std::make_unique<nixlObsObjMetadata>(nixl_mem, std::move(registration)).release();
     }
     catch (...) {
-        registeredMemory_.deregisterMemory(registration, release_descriptor);
+        registeredMemory_.deregisterMemory(registration);
         return NIXL_ERR_BACKEND;
     }
     return NIXL_SUCCESS;
@@ -526,17 +526,7 @@ S3DellObsObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
         return NIXL_SUCCESS;
     }
 
-    const bool released = registeredMemory_.deregisterMemory(
-        md->rdmaRegistration, [this](uintptr_t descriptor_base) {
-            const std::lock_guard<std::mutex> lock(cuClientMutex_);
-            const cuObjErr_t status =
-                cuClient_->putDescriptor(reinterpret_cast<void *>(descriptor_base));
-            if (status != CU_OBJ_SUCCESS) {
-                NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << status;
-                return false;
-            }
-            return true;
-        });
+    const bool released = registeredMemory_.deregisterMemory(md->rdmaRegistration);
     if (!released) {
         return NIXL_ERR_BACKEND;
     }
@@ -597,7 +587,11 @@ S3DellObsObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
         // Preserve the existing zero-length prep behavior. The Dell S3 client
         // rejects the request when posted, as it did before range resolution.
         if (req.size != 0) {
-            req.memoryLease = registeredMemory_.resolveAndAcquire(req.addr, req.size);
+            const auto memory_type = local.getType() == VRAM_SEG
+                                         ? nixl_obj_rdma::RegisteredMemoryType::Vram
+                                         : nixl_obj_rdma::RegisteredMemoryType::Dram;
+            req.memoryLease =
+                registeredMemory_.resolveAndAcquire(req.addr, req.size, memory_type);
             if (!req.memoryLease.valid()) {
                 NIXL_ERROR << "Dell RDMA range is not contained in one registered descriptor: "
                            << "status="

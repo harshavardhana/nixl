@@ -267,6 +267,11 @@ RDMA-only — the SDK cannot stream a GPU pointer).
 Both the standard-S3 and Dell accelerated engines apply the same registered
 memory rules:
 
+- DRAM and VRAM are independent address spaces. The same numeric address range
+  may be registered once in each type, and a transfer resolves only against the
+  type declared by its local descriptor list. Duplicate and overlap rules are
+  enforced within each type; adjacent ranges of different types are never
+  combined into one transfer.
 - A logical DRAM or VRAM registration is split into adjacent cuObject
   descriptors, each no larger than `CUOBJ_MAX_MEMORY_REG_SIZE` (currently
   4 GiB). Registration is transactional: if any chunk fails, every chunk
