@@ -28,6 +28,8 @@ obj_sources = [
     # internally guarded by HAVE_CUOBJ_CLIENT and compiles to nothing when the
     # cuObjClient library is absent; rdma_protocol.h is dependency-free.
     's3/rdma_protocol.h',
+    's3/registered_memory.cpp',
+    's3/registered_memory.h',
     's3/rdma.cpp',
     's3/rdma.h',
     # Standard, protocol-compliant S3-over-RDMA engine. Built unconditionally (it
