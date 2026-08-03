@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -127,7 +128,8 @@ struct RegisteredMemoryFragments {
  * DRAM and VRAM are independent address spaces, so identical or overlapping
  * numeric ranges may coexist when their memory types differ. Within one memory
  * type, exact duplicates are reference-counted by owner, partial overlaps are
- * rejected, and adjacent ranges remain distinct registrations.
+ * rejected, and adjacent ranges remain distinct registrations. Read-only
+ * queries share access; insertion and removal take exclusive access.
  */
 class RegisteredMemoryRegistry {
 public:
@@ -161,7 +163,7 @@ private:
     RangeInsertResult
     checkInsertLocked(const RegisteredMemoryRange &range) const;
 
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
     std::map<RegisteredMemoryKey, Entry> ranges_;
 };
 
@@ -182,7 +184,8 @@ struct LogicalMemoryRegistration {
  * rollback, and deregistration uses the same descriptor provider. This also
  * allows chunking and rollback to be tested without cuObject or a multi-GiB
  * allocation. The manager serializes descriptor acquisition/release with range
- * publication and lookup.
+ * publication, while allowing concurrent read-only resolution and lease
+ * acquisition.
  */
 class RegisteredMemoryManager {
 public:
@@ -280,7 +283,7 @@ private:
     const size_t maxRegistrationSize_;
     const AcquireDescriptor acquireDescriptor_;
     const ReleaseDescriptor releaseDescriptor_;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
     RegisteredMemoryRegistry registry_;
     std::map<RegisteredMemoryKey, std::shared_ptr<DescriptorLifetime>> lifetimes_;
     std::map<RegisteredMemoryKey, RegisteredMemoryRange> retiringRanges_;

@@ -54,13 +54,13 @@ RegisteredMemoryRegistry::checkInsertLocked(const RegisteredMemoryRange &range) 
 
 RangeInsertResult
 RegisteredMemoryRegistry::checkInsert(const RegisteredMemoryRange &range) const {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     return checkInsertLocked(range);
 }
 
 RangeInsertResult
 RegisteredMemoryRegistry::insert(const RegisteredMemoryRange &range, uint64_t owner_id) {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::unique_lock<std::shared_mutex> lock(mutex_);
     const RangeInsertResult result = checkInsertLocked(range);
     if (result == RangeInsertResult::Inserted) {
         uintptr_t last_address = 0;
@@ -80,7 +80,7 @@ RegisteredMemoryRegistry::insert(const RegisteredMemoryRange &range, uint64_t ow
 
 RangeRemoveResult
 RegisteredMemoryRegistry::remove(const RegisteredMemoryRange &range, uint64_t owner_id) {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::unique_lock<std::shared_mutex> lock(mutex_);
     auto it = ranges_.find({range.memoryType, range.descriptorBase});
     if (it == ranges_.end() || it->second.range.length != range.length) {
         return RangeRemoveResult::NotFound;
@@ -108,7 +108,7 @@ RegisteredMemoryRegistry::resolve(uintptr_t request_addr,
         return {RangeResolveStatus::AddressOverflow};
     }
 
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     auto next = ranges_.upper_bound({memory_type, request_addr});
     if (next == ranges_.begin()) {
         return {RangeResolveStatus::NotFound};
@@ -162,7 +162,7 @@ RegisteredMemoryManager::resolveAndAcquireFragments(uintptr_t request_addr,
         return fragments;
     }
 
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     uintptr_t current = request_addr;
     size_t remaining = request_len;
     while (remaining != 0) {
@@ -229,7 +229,7 @@ RegisteredMemoryManager::resolveAndAcquireFragments(uintptr_t request_addr,
 
 size_t
 RegisteredMemoryRegistry::size() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     return ranges_.size();
 }
 
@@ -325,7 +325,7 @@ RegisteredMemoryManager::registerMemory(uintptr_t base,
         return false;
     }
 
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::unique_lock<std::shared_mutex> lock(mutex_);
     uint64_t owner_id = nextOwnerId_++;
     if (owner_id == 0) {
         owner_id = nextOwnerId_++;
@@ -435,7 +435,7 @@ RegisteredMemoryManager::deregisterMemory(LogicalMemoryRegistration &registratio
         return false;
     }
 
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     bool success = true;
 
     struct PendingRelease {
@@ -503,7 +503,7 @@ RegisteredMemoryResolution
 RegisteredMemoryManager::resolve(uintptr_t request_addr,
                                  size_t request_len,
                                  RegisteredMemoryType memory_type) const {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     return registry_.resolve(request_addr, request_len, memory_type);
 }
 
@@ -511,7 +511,7 @@ RegisteredMemoryLease
 RegisteredMemoryManager::resolveAndAcquire(uintptr_t request_addr,
                                            size_t request_len,
                                            RegisteredMemoryType memory_type) const {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     const RegisteredMemoryResolution resolution =
         registry_.resolve(request_addr, request_len, memory_type);
     if (resolution.status != RangeResolveStatus::Resolved) {
@@ -547,7 +547,7 @@ RegisteredMemoryManager::resolveAndAcquire(uintptr_t request_addr,
 
 size_t
 RegisteredMemoryManager::rangeCount() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);
     return registry_.size();
 }
 
