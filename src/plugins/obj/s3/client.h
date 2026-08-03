@@ -52,6 +52,7 @@ public:
                    uintptr_t data_ptr,
                    size_t data_len,
                    size_t offset,
+                   nixl_mem_t memory_type,
                    put_object_callback_t callback) override;
 
     void
@@ -59,6 +60,7 @@ public:
                    uintptr_t data_ptr,
                    size_t data_len,
                    size_t offset,
+                   nixl_mem_t memory_type,
                    get_object_callback_t callback) override;
 
     void

@@ -51,6 +51,7 @@ public:
      * @param data_ptr Pointer to the data to upload
      * @param data_len Length of the data in bytes
      * @param offset Offset within the object
+     * @param memory_type NIXL type of the local data pointer
      * @param callback Callback function to handle the result
      */
     virtual void
@@ -58,6 +59,7 @@ public:
                    uintptr_t data_ptr,
                    size_t data_len,
                    size_t offset,
+                   nixl_mem_t memory_type,
                    put_object_callback_t callback) = 0;
 
     /**
@@ -66,6 +68,7 @@ public:
      * @param data_ptr Pointer to the buffer to store the downloaded data
      * @param data_len Maximum length of data to read
      * @param offset Offset within the object to start reading from
+     * @param memory_type NIXL type of the local data pointer
      * @param callback Callback function to handle the result
      */
     virtual void
@@ -73,6 +76,7 @@ public:
                    uintptr_t data_ptr,
                    size_t data_len,
                    size_t offset,
+                   nixl_mem_t memory_type,
                    get_object_callback_t callback) = 0;
 
     /**

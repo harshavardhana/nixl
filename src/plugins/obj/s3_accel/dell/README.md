@@ -137,6 +137,23 @@ The Dell ObjectScale engine supports the following memory types:
 - `DRAM_SEG` - DRAM segment
 - `VRAM_SEG` - GPU memory segment
 
+DRAM and VRAM use the same transactional range registry as the standard S3
+accelerated engine, but are tracked as independent address spaces. Identical
+numeric DRAM and VRAM ranges may coexist, and transfers resolve only against
+the local descriptor's memory type. Logical registrations larger than
+`CUOBJ_MAX_MEMORY_REG_SIZE` are split into adjacent cuObject-sized chunks. An
+interior transfer is prepared with the owning chunk's registered base pointer
+and the registration-relative memory offset; the remote object's offset remains
+separate and is passed only to the S3 operation.
+
+The complete Dell transfer must currently fit inside one chunk. This restriction
+is specific to the vendor protocol; the standard `type=s3` engine fragments
+cross-chunk GETs and uses multipart PUT. Unregistered, partially registered, and
+cross-chunk Dell transfers fail during preparation before the S3 request is
+submitted. Deregistration prevents new preparation for the range and waits for
+in-flight operations before releasing descriptors. Exact duplicate
+registrations share descriptors; partial overlaps are rejected.
+
 ## Transfer Operations
 
 The Dell ObjectScale Object Storage backend supports read and write operations between local CPU or GPU memory and S3 objects. Here are the key aspects of transfer operations:

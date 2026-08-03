@@ -344,30 +344,6 @@ TEST_F(objDellTestFixture, DellRegisterMemUnsupportedType) {
     EXPECT_EQ(metadata, nullptr);
 }
 
-/** registerMem rejects DRAM/VRAM buffers exceeding CUOBJ_MAX_MEMORY_REG_SIZE (4 GiB). */
-TEST_F(objDellTestFixture, DellRegisterMemExceedsMaxSize) {
-    // Test that registerMem rejects DRAM/VRAM buffers larger than CUOBJ_MAX_MEMORY_REG_SIZE (4
-    // GiB). This constant is defined in cuobjclient.h; keep in sync if it changes.
-    constexpr size_t kMaxMemRegSize = 4ULL * 1024 * 1024 * 1024;
-    std::vector<char> dummy(1);
-
-    nixlBlobDesc mem_desc;
-    mem_desc.addr = reinterpret_cast<uintptr_t>(dummy.data());
-    mem_desc.len = kMaxMemRegSize + 1;
-    mem_desc.devId = 1;
-
-    nixlBackendMD *metadata = nullptr;
-    nixl_status_t status = objEngine_->registerMem(mem_desc, DRAM_SEG, metadata);
-    EXPECT_EQ(status, NIXL_ERR_NOT_SUPPORTED);
-    EXPECT_EQ(metadata, nullptr);
-
-    // Same check for VRAM_SEG
-    metadata = nullptr;
-    status = objEngine_->registerMem(mem_desc, VRAM_SEG, metadata);
-    EXPECT_EQ(status, NIXL_ERR_NOT_SUPPORTED);
-    EXPECT_EQ(metadata, nullptr);
-}
-
 /** prepXfer handles zero-length descriptors without crashing. */
 TEST_F(objDellTestFixture, DellEngineZeroSizePrep) {
     // Test that prepXfer accepts zero-size descriptors without crashing.
@@ -665,11 +641,8 @@ TEST_F(objDellTestFixture, DellPrepXferUnregisteredAddress) {
     objEngine_->deregisterMem(remote_metadata);
 }
 
-/** prepXfer fails when the local address exceeds the 16 MiB RDMA descriptor coverage limit. */
+/** An interior transfer beyond 16 MiB resolves against the registered base. */
 TEST_F(objDellTestFixture, DellPrepXferLargeMemoryOffset) {
-    // Test that cuObjPut fails when the local address is more than 16 MB from the
-    // base address of the registered memory region.
-    // This is a cuObject library constraint on RDMA descriptor coverage.
     constexpr size_t k16MiB = 16ULL * 1024 * 1024;
     constexpr size_t kBufSize = k16MiB + 4096;
     std::vector<char> large_buffer(kBufSize);
@@ -690,7 +663,6 @@ TEST_F(objDellTestFixture, DellPrepXferLargeMemoryOffset) {
     nixl_meta_dlist_t local_descs(DRAM_SEG);
     nixl_meta_dlist_t remote_descs(OBJ_SEG);
 
-    // Use an address > 16 MiB from the registered base
     uintptr_t offset_addr = reinterpret_cast<uintptr_t>(large_buffer.data()) + k16MiB + 1;
     nixlMetaDesc local_meta_desc(offset_addr, 1024, local_desc.devId);
     nixlMetaDesc remote_meta_desc(0, 1024, remote_desc.devId);
@@ -701,8 +673,10 @@ TEST_F(objDellTestFixture, DellPrepXferLargeMemoryOffset) {
     nixl_status_t status = objEngine_->prepXfer(
         NIXL_WRITE, local_descs, remote_descs, initParams_.localAgent, handle, nullptr);
 
-    EXPECT_EQ(status, NIXL_ERR_BACKEND);
-    EXPECT_EQ(handle, nullptr);
+    EXPECT_EQ(status, NIXL_SUCCESS);
+    ASSERT_NE(handle, nullptr);
+
+    objEngine_->releaseReqH(handle);
 
     objEngine_->deregisterMem(local_metadata);
     objEngine_->deregisterMem(remote_metadata);

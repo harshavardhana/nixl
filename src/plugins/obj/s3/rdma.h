@@ -25,65 +25,20 @@
 // rdma_protocol.h and have no such dependency.
 
 #include "rdma_protocol.h"
+#include "registered_memory.h"
 
 #ifdef HAVE_CUOBJ_CLIENT
 
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <cuobjclient.h>
 
 #include "nixl_types.h"
 
 namespace nixl_obj_rdma {
-
-/**
- * Process-wide cuObjClient singleton.
- *
- * libcuobjclient is expensive to construct and its callbacks may fire on
- * threads other than the caller's; constructing one per backend (or per call)
- * was observed to corrupt allocator state under concurrency in the reference
- * SDKs. A single instance per process is the supported pattern. Buffer
- * registration (cuMemObjGetDescriptor) and token minting are serialized through
- * an internal mutex.
- */
-class SharedCuObjClient {
-public:
-    /// Returns the process-wide instance, or nullptr if the fabric is unavailable.
-    static SharedCuObjClient *
-    instance();
-
-    bool
-    isConnected() const {
-        return connected_;
-    }
-
-    /// Pin a buffer for RDMA. Required before minting a token for it.
-    bool
-    registerBuffer(void *ptr, size_t size);
-
-    /// Release a buffer registration acquired via registerBuffer().
-    void
-    deregisterBuffer(void *ptr);
-
-    /// True if the pointer is CUDA device (VRAM) memory (no HTTP fallback possible).
-    bool
-    isDeviceMemory(const void *ptr) const;
-
-    /// Mint an RDMA token for a registered buffer (caller releases via putToken()).
-    char *
-    getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op);
-    void
-    putToken(char *token);
-
-private:
-    SharedCuObjClient();
-    CUObjIOOps ops_{};
-    std::unique_ptr<cuObjClient> client_;
-    bool connected_ = false;
-    std::mutex mutex_;
-};
 
 /// Per-call context for an RDMA PUT/GET control-plane request.
 /// (region/credentials live in the control plane's signer, not here.)
@@ -96,6 +51,122 @@ struct S3RdmaClientCtx {
     std::string etag; // populated on success
 };
 
+struct RdmaMultipartPart {
+    uint32_t partNumber = 0;
+    std::string etag;
+};
+
+class RdmaMemoryProvider {
+public:
+    virtual ~RdmaMemoryProvider() = default;
+
+    virtual RegisteredMemoryLease
+    acquireBuffer(const void *ptr, size_t size, RegisteredMemoryType memory_type) const = 0;
+
+    virtual RegisteredMemoryFragments
+    acquireBuffers(const void *ptr, size_t size, RegisteredMemoryType memory_type) const = 0;
+
+    virtual char *
+    getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op) = 0;
+
+    virtual void
+    putToken(char *token) = 0;
+};
+
+class RdmaControlPlane {
+public:
+    virtual ~RdmaControlPlane() = default;
+
+    virtual ssize_t
+    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t buf_addr, uint64_t size) = 0;
+
+    virtual ssize_t
+    rdmaGet(S3RdmaClientCtx &ctx,
+            const char *token,
+            uint64_t buf_addr,
+            uint64_t size,
+            uint64_t offset) = 0;
+
+    virtual bool
+    beginMultipartUpload(S3RdmaClientCtx &ctx) = 0;
+
+    virtual bool
+    completeMultipartUpload(S3RdmaClientCtx &ctx, const std::vector<RdmaMultipartPart> &parts) = 0;
+
+    virtual void
+    abortMultipartUpload(S3RdmaClientCtx &ctx) = 0;
+};
+
+/**
+ * Process-wide cuObjClient singleton.
+ *
+ * libcuobjclient is expensive to construct and its callbacks may fire on
+ * threads other than the caller's; constructing one per backend (or per call)
+ * was observed to corrupt allocator state under concurrency in the reference
+ * SDKs. A single instance per process is the supported pattern. Buffer
+ * registration (cuMemObjGetDescriptor) and token minting are serialized through
+ * an internal mutex.
+ */
+class SharedCuObjClient : public RdmaMemoryProvider {
+public:
+    /// Returns the process-wide instance, or nullptr if the fabric is unavailable.
+    static SharedCuObjClient *
+    instance();
+
+    bool
+    isConnected() const {
+        return connected_;
+    }
+
+    /// Pin a buffer for RDMA. Required before minting a token for it.
+    bool
+    registerBuffer(void *ptr,
+                   size_t size,
+                   RegisteredMemoryType memory_type,
+                   LogicalMemoryRegistration &registration);
+
+    /// Release a buffer registration acquired via registerBuffer().
+    bool
+    deregisterBuffer(LogicalMemoryRegistration &registration);
+
+    /// Resolve and pin a complete transfer range to its registered descriptor.
+    RegisteredMemoryLease
+    acquireBuffer(const void *ptr, size_t size, RegisteredMemoryType memory_type) const override;
+
+    /// Resolve and pin a transfer, splitting it at descriptor boundaries.
+    RegisteredMemoryFragments
+    acquireBuffers(const void *ptr, size_t size, RegisteredMemoryType memory_type) const override;
+
+    /// True if the pointer is CUDA device (VRAM) memory (no HTTP fallback possible).
+    bool
+    isDeviceMemory(const void *ptr) const;
+
+    /// Mint an RDMA token for a registered buffer (caller releases via putToken()).
+    char *
+    getToken(void *ptr, size_t size, size_t offset, cuObjOpType_t op) override;
+    void
+    putToken(char *token) override;
+
+private:
+    SharedCuObjClient();
+    bool
+    acquireDescriptor(uintptr_t descriptor_base, size_t registered_length);
+    bool
+    releaseDescriptor(uintptr_t descriptor_base);
+
+    CUObjIOOps ops_{};
+    std::unique_ptr<cuObjClient> client_;
+    bool connected_ = false;
+    std::mutex mutex_;
+    RegisteredMemoryManager registeredMemory_{
+        CUOBJ_MAX_MEMORY_REG_SIZE - 1,
+        [this](uintptr_t descriptor_base, size_t registered_length) {
+            return acquireDescriptor(descriptor_base, registered_length);
+        },
+        [this](uintptr_t descriptor_base) { return releaseDescriptor(descriptor_base); }};
+};
+
+
 /**
  * S3 RDMA control plane.
  *
@@ -105,7 +176,7 @@ struct S3RdmaClientCtx {
  * low-level HTTP layer; it is deliberately narrow so the protocol logic around
  * it stays SDK-agnostic and testable.
  */
-class S3RdmaControlPlane {
+class S3RdmaControlPlane : public RdmaControlPlane {
 public:
     explicit S3RdmaControlPlane(nixl_b_params_t *custom_params);
     ~S3RdmaControlPlane();
@@ -121,7 +192,7 @@ public:
      *         server declined, or rdma_error on transport failure.
      */
     ssize_t
-    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t buf_addr, uint64_t size);
+    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t buf_addr, uint64_t size) override;
 
     /**
      * Issue the signed control-plane GET carrying the RDMA token. When
@@ -134,7 +205,17 @@ public:
             const char *token,
             uint64_t buf_addr,
             uint64_t size,
-            uint64_t offset);
+            uint64_t offset) override;
+
+    bool
+    beginMultipartUpload(S3RdmaClientCtx &ctx) override;
+
+    bool
+    completeMultipartUpload(S3RdmaClientCtx &ctx,
+                            const std::vector<RdmaMultipartPart> &parts) override;
+
+    void
+    abortMultipartUpload(S3RdmaClientCtx &ctx) override;
 
 private:
     struct Impl;
@@ -152,19 +233,21 @@ private:
  *         there is no HTTP fallback under accelerated=true.
  */
 ssize_t
-rdmaPutWithRetry(SharedCuObjClient &rdma,
-                 S3RdmaControlPlane &cp,
-                 S3RdmaClientCtx &ctx,
-                 void *buf,
-                 size_t size);
-
-ssize_t
-rdmaGetWithRetry(SharedCuObjClient &rdma,
-                 S3RdmaControlPlane &cp,
+rdmaPutWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
                  S3RdmaClientCtx &ctx,
                  void *buf,
                  size_t size,
-                 size_t offset);
+                 RegisteredMemoryType memory_type);
+
+ssize_t
+rdmaGetWithRetry(RdmaMemoryProvider &rdma,
+                 RdmaControlPlane &cp,
+                 S3RdmaClientCtx &ctx,
+                 void *buf,
+                 size_t size,
+                 size_t offset,
+                 RegisteredMemoryType memory_type);
 
 } // namespace nixl_obj_rdma
 

@@ -120,7 +120,9 @@ awsS3Client::putObjectAsync(std::string_view key,
                             uintptr_t data_ptr,
                             size_t data_len,
                             size_t offset,
+                            nixl_mem_t memory_type,
                             put_object_callback_t callback) {
+    (void)memory_type;
     if (offset != 0) {
         callback(false);
         return;
@@ -132,15 +134,29 @@ awsS3Client::putObjectAsync(std::string_view key,
     if (rdma_requested_) {
 #ifdef HAVE_CUOBJ_CLIENT
         if (rdmaReady()) {
-            executor_->Submit([this, k = std::string(key), data_ptr, data_len, callback]() {
+            const auto registered_memory_type =
+                memory_type == VRAM_SEG ? nixl_obj_rdma::RegisteredMemoryType::Vram
+                                        : nixl_obj_rdma::RegisteredMemoryType::Dram;
+            executor_->Submit([this,
+                               k = std::string(key),
+                               data_ptr,
+                               data_len,
+                               registered_memory_type,
+                               callback]() {
                 nixl_obj_rdma::S3RdmaClientCtx ctx;
                 ctx.bucket = bucketName_.c_str();
                 ctx.object = k;
                 const ssize_t r = nixl_obj_rdma::rdmaPutWithRetry(
-                    *rdma_, *rdmaCp_, ctx, reinterpret_cast<void *>(data_ptr), data_len);
+                    *rdma_,
+                    *rdmaCp_,
+                    ctx,
+                    reinterpret_cast<void *>(data_ptr),
+                    data_len,
+                    registered_memory_type);
                 callback(r >= 0);
                 if (r < 0) {
-                    NIXL_ERROR << "RDMA PUT failed (accelerated enabled); no HTTP fallback";
+                    NIXL_ERROR << "RDMA PUT failed (accelerated enabled); no HTTP fallback, error "
+                               << r;
                 }
             });
             return;
@@ -177,21 +193,39 @@ awsS3Client::getObjectAsync(std::string_view key,
                             uintptr_t data_ptr,
                             size_t data_len,
                             size_t offset,
+                            nixl_mem_t memory_type,
                             get_object_callback_t callback) {
+    (void)memory_type;
     // See putObjectAsync: under accelerated=true (generic S3-over-RDMA), GET is
     // RDMA-only with no silent HTTP fallback; fail if the fast path is not ready.
     if (rdma_requested_) {
 #ifdef HAVE_CUOBJ_CLIENT
         if (rdmaReady()) {
-            executor_->Submit([this, k = std::string(key), data_ptr, data_len, offset, callback]() {
+            const auto registered_memory_type =
+                memory_type == VRAM_SEG ? nixl_obj_rdma::RegisteredMemoryType::Vram
+                                        : nixl_obj_rdma::RegisteredMemoryType::Dram;
+            executor_->Submit([this,
+                               k = std::string(key),
+                               data_ptr,
+                               data_len,
+                               offset,
+                               registered_memory_type,
+                               callback]() {
                 nixl_obj_rdma::S3RdmaClientCtx ctx;
                 ctx.bucket = bucketName_.c_str();
                 ctx.object = k;
                 const ssize_t r = nixl_obj_rdma::rdmaGetWithRetry(
-                    *rdma_, *rdmaCp_, ctx, reinterpret_cast<void *>(data_ptr), data_len, offset);
+                    *rdma_,
+                    *rdmaCp_,
+                    ctx,
+                    reinterpret_cast<void *>(data_ptr),
+                    data_len,
+                    offset,
+                    registered_memory_type);
                 callback(r >= 0);
                 if (r < 0) {
-                    NIXL_ERROR << "RDMA GET failed (accelerated enabled); no HTTP fallback";
+                    NIXL_ERROR << "RDMA GET failed (accelerated enabled); no HTTP fallback, error "
+                               << r;
                 }
             });
             return;

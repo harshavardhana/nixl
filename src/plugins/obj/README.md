@@ -262,6 +262,50 @@ decline/failure is a hard error, not a silent HTTP fallback, since
 `accelerated=true` asserts the endpoint speaks the protocol (VRAM is always
 RDMA-only — the SDK cannot stream a GPU pointer).
 
+### Registered-memory ranges and size limits
+
+Both the standard-S3 and Dell accelerated engines apply the same registered
+memory rules:
+
+- DRAM and VRAM are independent address spaces. The same numeric address range
+  may be registered once in each type, and a transfer resolves only against the
+  type declared by its local descriptor list. Duplicate and overlap rules are
+  enforced within each type; adjacent ranges of different types are never
+  combined into one transfer.
+- A logical DRAM or VRAM registration is split into adjacent cuObject
+  descriptors, each no larger than `CUOBJ_MAX_MEMORY_REG_SIZE` (currently
+  4 GiB). Registration is transactional: if any chunk fails, every chunk
+  acquired by that operation is released and no range is published.
+- A transfer may start at any interior address of a registered chunk. Token or
+  Dell descriptor preparation uses the chunk's registered base pointer and
+  `request_address - registered_base` as the memory offset. The actual requested
+  address is still advertised to the storage control plane.
+- The S3 object offset is independent of this memory offset. It continues to
+  select the remote object range and is never added to the cuObject
+  registration-relative offset.
+- The standard-S3 engine can span adjacent registration chunks. It holds leases
+  for the complete range, then mints and releases one token per ordered fragment.
+  GET advances the S3 `Range` offset by the bytes already transferred. PUT keeps
+  the single-request fast path for one chunk and uses S3 multipart upload for
+  multiple chunks, completing the object only after every RDMA `UploadPart`
+  succeeds.
+- Multipart PUT follows S3 limits: at most 10,000 parts and every non-final part
+  is at least 5 MiB. A transfer beginning too near a chunk boundary to satisfy
+  that minimum is rejected before the multipart upload starts. On any part or
+  completion failure, the request reports an error and aborts the upload on a
+  best-effort basis, so no incomplete object is completed or exposed.
+- Fragmented GET reports one aggregate error if any fragment fails. Bytes written
+  by earlier GET fragments remain in the local buffer; tokens and descriptor
+  leases for every fragment are still released. NIXL exposes no mid-flight
+  cancellation hook for this executor request, so fragments run sequentially to
+  success or first failure.
+- The Dell vendor engine still requires the complete transfer to fit in one
+  registration chunk; its vendor-specific protocol has no implemented
+  cross-chunk composition path. Unregistered, partially registered, overflowing,
+  and unsupported cross-chunk requests fail before storage I/O.
+- Deregistration removes ranges from new lookups immediately, then waits for
+  in-flight transfer leases before releasing their cuObject descriptors.
+
 The full wire contract — headers, token format, transport, server obligations,
 completion rules, and a vendor compliance checklist — is in
 [**RDMA_PROTOCOL.md**](RDMA_PROTOCOL.md); a server that implements it is

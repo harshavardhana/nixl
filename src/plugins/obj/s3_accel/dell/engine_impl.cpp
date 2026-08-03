@@ -14,6 +14,7 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <utility>
 
 #include "obj_engine_registry.h"
 
@@ -102,6 +103,8 @@ public:
     std::string rdma_desc;
     /// Object key in S3
     std::string obj_key;
+    /// Pins the owning cuObject descriptor through transfer completion.
+    nixl_obj_rdma::RegisteredMemoryLease memoryLease;
     /// RDMA context for async operations
     rdma_ctx_t ctx;
 
@@ -196,21 +199,16 @@ public:
         : nixlBackendMD(true),
           nixlMem(nixl_mem),
           devId(dev_id),
-          objKey(obj_key),
-          localAddr(0) {}
+          objKey(std::move(obj_key)) {}
 
-    /**
-     * Constructor for memory segments (DRAM/VRAM).
-     *
-     * @param nixl_mem Memory type
-     * @param addr Local memory address
-     */
-    nixlObsObjMetadata(nixl_mem_t nixl_mem, uintptr_t addr)
+    /** Constructor for memory segments (DRAM/VRAM), owning all chunks. */
+    nixlObsObjMetadata(nixl_mem_t nixl_mem,
+                       nixl_obj_rdma::LogicalMemoryRegistration &&registration)
         : nixlBackendMD(true),
           nixlMem(nixl_mem),
           devId(0),
           objKey(""),
-          localAddr(addr) {}
+          rdmaRegistration(std::move(registration)) {}
 
     ~nixlObsObjMetadata() = default;
 
@@ -220,8 +218,8 @@ public:
     uint64_t devId;
     /// Object key in S3
     std::string objKey;
-    /// Local memory address
-    uintptr_t localAddr;
+    /// Every cuObject chunk belonging to one logical NIXL registration.
+    nixl_obj_rdma::LogicalMemoryRegistration rdmaRegistration;
 };
 
 /**
@@ -294,6 +292,41 @@ objectPut(const void *handle,
 
 /// cuObject I/O operations for ObjectScale
 CUObjIOOps obs_ops = {.get = objectGet, .put = objectPut};
+
+class DellCuObjClient final : public iDellCuObjClient {
+public:
+    DellCuObjClient()
+        : client_(std::make_shared<cuObjClient>(obs_ops, CUOBJ_PROTO_RDMA_DC_V1)) {}
+
+    bool
+    isConnected() const override {
+        return client_->isConnected();
+    }
+
+    cuObjErr_t
+    getDescriptor(void *ptr, size_t size) override {
+        return client_->cuMemObjGetDescriptor(ptr, size);
+    }
+
+    cuObjErr_t
+    putDescriptor(void *ptr) override {
+        return client_->cuMemObjPutDescriptor(ptr);
+    }
+
+    ssize_t
+    putObject(void *ctx, void *ptr, size_t size, size_t memory_offset) override {
+        return client_->cuObjPut(ctx, ptr, size, memory_offset);
+    }
+
+    ssize_t
+    getObject(void *ctx, void *ptr, size_t size, size_t memory_offset) override {
+        return client_->cuObjGet(ctx, ptr, size, memory_offset);
+    }
+
+private:
+    std::shared_ptr<cuObjClient> client_;
+};
+
 } // namespace
 
 /**
@@ -320,7 +353,7 @@ S3DellObsObjEngineImpl::S3DellObsObjEngineImpl(const nixlBackendInitParams *init
     s3Client_ = std::make_shared<awsS3DellObsClient>(params_to_use, executor_);
     NIXL_INFO << "Object storage backend initialized with S3 Dell ObjectScale client";
 
-    cuClient_ = std::make_shared<cuObjClient>(obs_ops, CUOBJ_PROTO_RDMA_DC_V1);
+    cuClient_ = std::make_shared<DellCuObjClient>();
     if (!cuClient_->isConnected()) {
         NIXL_ERROR << "CUObjClient failed to connect.";
         return;
@@ -355,11 +388,60 @@ S3DellObsObjEngineImpl::S3DellObsObjEngineImpl(const nixlBackendInitParams *init
 
     NIXL_INFO << "Object storage backend initialized with S3 Dell ObjectScale client";
 
-    cuClient_ = std::make_shared<cuObjClient>(obs_ops, CUOBJ_PROTO_RDMA_DC_V1);
+    cuClient_ = std::make_shared<DellCuObjClient>();
     if (!cuClient_->isConnected()) {
         NIXL_ERROR << "CUObjClient failed to connect.";
         return;
     }
+}
+
+S3DellObsObjEngineImpl::S3DellObsObjEngineImpl(
+    const nixlBackendInitParams *init_params,
+    std::shared_ptr<iS3Client> s3_client,
+    std::shared_ptr<iDellCuObjClient> cu_client)
+    : S3AccelObjEngineImpl(init_params, s3_client),
+      s3Client_(std::move(s3_client)),
+      cuClient_(std::move(cu_client)) {
+    nixl_b_params_t *params_to_use = init_params->customParams;
+    nixl_b_params_t local_params;
+    if (!init_params->customParams) {
+        local_params["resp_checksum"] = "required";
+        params_to_use = &local_params;
+    } else {
+        init_params->customParams->emplace("resp_checksum", "required");
+    }
+    if (!s3Client_) {
+        s3Client_ = std::make_shared<awsS3DellObsClient>(params_to_use, executor_);
+    }
+    if (!cuClient_) {
+        cuClient_ = std::make_shared<DellCuObjClient>();
+    }
+    if (!cuClient_->isConnected()) {
+        NIXL_ERROR << "CUObjClient failed to connect.";
+    }
+}
+
+bool
+S3DellObsObjEngineImpl::acquireDescriptor(uintptr_t descriptor_base, size_t registered_length) {
+    const std::lock_guard<std::mutex> lock(cuClientMutex_);
+    const cuObjErr_t status =
+        cuClient_->getDescriptor(reinterpret_cast<void *>(descriptor_base), registered_length);
+    if (status != CU_OBJ_SUCCESS) {
+        NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << status;
+        return false;
+    }
+    return true;
+}
+
+bool
+S3DellObsObjEngineImpl::releaseDescriptor(uintptr_t descriptor_base) {
+    const std::lock_guard<std::mutex> lock(cuClientMutex_);
+    const cuObjErr_t status = cuClient_->putDescriptor(reinterpret_cast<void *>(descriptor_base));
+    if (status != CU_OBJ_SUCCESS) {
+        NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << status;
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -378,41 +460,49 @@ nixl_status_t
 S3DellObsObjEngineImpl::registerMem(const nixlBlobDesc &mem,
                                     const nixl_mem_t &nixl_mem,
                                     nixlBackendMD *&out) {
+    out = nullptr;
     if (!cuClient_->isConnected()) {
         NIXL_ERROR << "CUObjClient is not connected.";
         return NIXL_ERR_BACKEND;
     }
 
-    auto supported_mems = {OBJ_SEG, DRAM_SEG, VRAM_SEG};
+    const auto supported_mems = {OBJ_SEG, DRAM_SEG, VRAM_SEG};
     if (std::find(supported_mems.begin(), supported_mems.end(), nixl_mem) == supported_mems.end()) {
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
     if (nixl_mem == OBJ_SEG) {
-        std::unique_ptr<nixlObsObjMetadata> obj_md = std::make_unique<nixlObsObjMetadata>(
+        auto obj_md = std::make_unique<nixlObsObjMetadata>(
             nixl_mem, mem.devId, mem.metaInfo.empty() ? std::to_string(mem.devId) : mem.metaInfo);
-        devIdToObjKey_[mem.devId] = obj_md->objKey;
+        {
+            const std::lock_guard<std::mutex> lock(objectMapMutex_);
+            devIdToObjKey_[mem.devId] = obj_md->objKey;
+        }
         out = obj_md.release();
-    } else if ((nixl_mem == DRAM_SEG) || (nixl_mem == VRAM_SEG)) {
-
-        if (mem.len > CUOBJ_MAX_MEMORY_REG_SIZE) {
-            NIXL_ERROR << "Memory size too large for cuObject registration: " << mem.len;
-            return NIXL_ERR_NOT_SUPPORTED;
-        }
-
-        NIXL_DEBUG << "registerMem: addr=" << mem.addr << ", len=" << mem.len
-                   << ", nixl_mem=" << nixl_mem;
-        std::unique_ptr<nixlObsObjMetadata> mem_md =
-            std::make_unique<nixlObsObjMetadata>(nixl_mem, mem.addr);
-
-        cuObjErr_t cuda_status = cuClient_->cuMemObjGetDescriptor((void *)(mem.addr), mem.len);
-        if (cuda_status != CU_OBJ_SUCCESS) {
-            NIXL_ERROR << "cuMemObjGetDescriptor failed with status: " << cuda_status;
-            return NIXL_ERR_BACKEND;
-        }
-        out = mem_md.release();
+        return NIXL_SUCCESS;
     }
 
+    NIXL_DEBUG << "registerMem: addr=" << mem.addr << ", len=" << mem.len
+               << ", nixl_mem=" << nixl_mem;
+    nixl_obj_rdma::LogicalMemoryRegistration registration;
+    const auto memory_type = nixl_mem == VRAM_SEG
+                                 ? nixl_obj_rdma::RegisteredMemoryType::Vram
+                                 : nixl_obj_rdma::RegisteredMemoryType::Dram;
+
+    const bool registered =
+        registeredMemory_.registerMemory(mem.addr, mem.len, memory_type, registration);
+    if (!registered) {
+        NIXL_ERROR << "Transactional cuObject memory registration failed";
+        return NIXL_ERR_BACKEND;
+    }
+
+    try {
+        out = std::make_unique<nixlObsObjMetadata>(nixl_mem, std::move(registration)).release();
+    }
+    catch (...) {
+        registeredMemory_.deregisterMemory(registration);
+        return NIXL_ERR_BACKEND;
+    }
     return NIXL_SUCCESS;
 }
 
@@ -425,25 +515,20 @@ S3DellObsObjEngineImpl::registerMem(const nixlBlobDesc &mem,
  */
 nixl_status_t
 S3DellObsObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
-    nixlObsObjMetadata *md = static_cast<nixlObsObjMetadata *>(meta);
-    if (md) {
-        if (md->nixlMem == OBJ_SEG) {
-            std::unique_ptr<nixlObsObjMetadata> obj_md_ptr =
-                std::unique_ptr<nixlObsObjMetadata>(md);
-            devIdToObjKey_.erase(obj_md_ptr->devId);
-        } else if ((md->nixlMem == DRAM_SEG) || (md->nixlMem == VRAM_SEG)) {
-            std::unique_ptr<nixlObsObjMetadata> mem_md_ptr =
-                std::unique_ptr<nixlObsObjMetadata>(md);
-            cuObjErr_t cuda_status =
-                cuClient_->cuMemObjPutDescriptor((void *)(mem_md_ptr->localAddr));
-            if (cuda_status != CU_OBJ_SUCCESS) {
-                NIXL_ERROR << "cuMemObjPutDescriptor failed with status: " << cuda_status;
-                // Transfer ownership back to caller since cuObject cleanup failed
-                // The nixlObsObjMetadata remains valid for caller to retry or clean up
-                mem_md_ptr.release();
-                return NIXL_ERR_BACKEND;
-            }
-        }
+    std::unique_ptr<nixlObsObjMetadata> md(static_cast<nixlObsObjMetadata *>(meta));
+    if (!md) {
+        return NIXL_SUCCESS;
+    }
+
+    if (md->nixlMem == OBJ_SEG) {
+        const std::lock_guard<std::mutex> lock(objectMapMutex_);
+        devIdToObjKey_.erase(md->devId);
+        return NIXL_SUCCESS;
+    }
+
+    const bool released = registeredMemory_.deregisterMemory(md->rdmaRegistration);
+    if (!released) {
+        return NIXL_ERR_BACKEND;
     }
     return NIXL_SUCCESS;
 }
@@ -472,6 +557,7 @@ S3DellObsObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
                                  nixlBackendReqH *&handle,
                                  const nixl_opt_b_args_t *opt_args) const {
 
+    handle = nullptr;
     if (!cuClient_->isConnected()) {
         NIXL_ERROR << "CUObjClient is not connected.";
         return NIXL_ERR_BACKEND;
@@ -487,32 +573,56 @@ S3DellObsObjEngineImpl::prepXfer(const nixl_xfer_op_t &operation,
         obsObjTransferRequestH req(local[i].addr, local[i].len, remote[i].addr);
 
         // Validate devId-to-object-key mapping before cuObj operations
-        auto obj_key_search = devIdToObjKey_.find(remote[i].devId);
-        if (obj_key_search == devIdToObjKey_.end()) {
-            NIXL_ERROR << "The object segment key " << remote[i].devId
-                       << " is not registered with the backend";
-            return NIXL_ERR_INVALID_PARAM;
+        {
+            const std::lock_guard<std::mutex> lock(objectMapMutex_);
+            auto obj_key_search = devIdToObjKey_.find(remote[i].devId);
+            if (obj_key_search == devIdToObjKey_.end()) {
+                NIXL_ERROR << "The object segment key " << remote[i].devId
+                           << " is not registered with the backend";
+                return NIXL_ERR_INVALID_PARAM;
+            }
+            req.obj_key = obj_key_search->second;
         }
-        req.obj_key = obj_key_search->second;
 
-        if (operation == NIXL_WRITE) {
-            ssize_t cuda_status =
-                cuClient_->cuObjPut(&req.ctx, (void *)req.addr, req.size, req.offset);
-            if (cuda_status < 0) {
-                NIXL_ERROR << "cuObjPut failed with status: " << cuda_status;
+        // Preserve the existing zero-length prep behavior. The Dell S3 client
+        // rejects the request when posted, as it did before range resolution.
+        if (req.size != 0) {
+            const auto memory_type = local.getType() == VRAM_SEG
+                                         ? nixl_obj_rdma::RegisteredMemoryType::Vram
+                                         : nixl_obj_rdma::RegisteredMemoryType::Dram;
+            req.memoryLease =
+                registeredMemory_.resolveAndAcquire(req.addr, req.size, memory_type);
+            if (!req.memoryLease.valid()) {
+                NIXL_ERROR << "Dell RDMA range is not contained in one registered descriptor: "
+                           << "status="
+                           << static_cast<int>(req.memoryLease.resolution().status)
+                           << " ptr=" << reinterpret_cast<void *>(req.addr)
+                           << " size=" << req.size;
                 return NIXL_ERR_BACKEND;
             }
-        } else if (operation == NIXL_READ) {
-            ssize_t cuda_status =
-                cuClient_->cuObjGet(&req.ctx, (void *)req.addr, req.size, req.offset);
+
+            const auto &resolution = req.memoryLease.resolution();
+            void *descriptor_base = reinterpret_cast<void *>(resolution.descriptorBase);
+            ssize_t cuda_status = 0;
+            {
+                const std::lock_guard<std::mutex> lock(cuClientMutex_);
+                if (operation == NIXL_WRITE) {
+                    cuda_status = cuClient_->putObject(
+                        &req.ctx, descriptor_base, req.size, resolution.registrationOffset);
+                } else {
+                    cuda_status = cuClient_->getObject(
+                        &req.ctx, descriptor_base, req.size, resolution.registrationOffset);
+                }
+            }
             if (cuda_status < 0) {
-                NIXL_ERROR << "cuObjGet failed with status: " << cuda_status;
+                NIXL_ERROR << (operation == NIXL_WRITE ? "cuObjPut" : "cuObjGet")
+                           << " failed with status: " << cuda_status;
                 return NIXL_ERR_BACKEND;
             }
         }
         req.rdma_desc = req.ctx.rdma_desc;
 
-        req_h->reqs_.push_back(req);
+        req_h->reqs_.push_back(std::move(req));
     }
 
     handle = req_h.release();
@@ -548,9 +658,11 @@ S3DellObsObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
 
     nixlObsObjBackendReqH *req_h = static_cast<nixlObsObjBackendReqH *>(handle);
 
-    for (const auto &req : req_h->reqs_) {
+    for (auto &req : req_h->reqs_) {
 
         auto status_promise = std::make_shared<std::promise<nixl_status_t>>();
+        auto memory_lease = std::make_shared<nixl_obj_rdma::RegisteredMemoryLease>(
+            std::move(req.memoryLease));
         req_h->statusFutures_.push_back(status_promise->get_future());
 
         // S3 client interface signals completion via a callback, but NIXL API polls request handle
@@ -569,7 +681,8 @@ S3DellObsObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
                                            req.size,
                                            req.offset,
                                            req.rdma_desc,
-                                           [status_promise](bool success) {
+                                           [status_promise, memory_lease](bool success) {
+                                               memory_lease->reset();
                                                status_promise->set_value(
                                                    success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
                                            });
@@ -579,7 +692,8 @@ S3DellObsObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
                                            req.size,
                                            req.offset,
                                            req.rdma_desc,
-                                           [status_promise](bool success) {
+                                           [status_promise, memory_lease](bool success) {
+                                               memory_lease->reset();
                                                status_promise->set_value(
                                                    success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
                                            });

@@ -13,10 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-obj_test_sources = ['obj.cpp', 'rdma_protocol.cpp']
+obj_test_sources = ['obj.cpp', 'rdma_protocol.cpp', 'registered_memory_test.cpp']
+obj_test_deps = [
+    obj_backend_interface,
+    dependency('asio', required: true),
+]
 
 if cuobj_dep.found()
-    obj_test_sources += ['mock_dell_s3_client.cpp', 'obj_cuobj.cpp']
+    obj_test_sources += [
+        'dell_registered_transfer_test.cpp',
+        'mock_dell_s3_client.cpp',
+        'obj_cuobj.cpp',
+        'rdma_transfer_test.cpp',
+    ]
+    obj_test_deps += [cuobj_dep]
 endif
 
 obj_unit_test_dep = declare_dependency(
@@ -25,8 +35,5 @@ obj_unit_test_dep = declare_dependency(
         nixl_inc_dirs, utils_inc_dirs,
         '../../../../src/plugins/obj',
     ],
-    dependencies: [
-        obj_backend_interface,
-        dependency('asio', required: true),
-    ],
+    dependencies: obj_test_deps,
 )

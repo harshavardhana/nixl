@@ -13,6 +13,7 @@
 #include <chrono>
 #include <future>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -88,12 +89,13 @@ public:
           devId(dev_id),
           objKey(obj_key) {}
 
-    // Memory segment (DRAM/VRAM) pinned for RDMA; records the address to
-    // release on deregister.
-    nixlObjMetadata(nixl_mem_t nixl_mem, uintptr_t addr)
+    // Memory segment (DRAM/VRAM) pinned for RDMA; owns every cuObject chunk
+    // created for the logical NIXL registration.
+    nixlObjMetadata(nixl_mem_t nixl_mem,
+                    nixl_obj_rdma::LogicalMemoryRegistration &&registration)
         : nixlBackendMD(true),
           nixlMem(nixl_mem),
-          localAddr(addr),
+          rdmaRegistration(std::move(registration)),
           rdmaRegistered(true) {}
 
     ~nixlObjMetadata() = default;
@@ -101,7 +103,7 @@ public:
     nixl_mem_t nixlMem;
     uint64_t devId = 0;
     std::string objKey;
-    uintptr_t localAddr = 0;
+    nixl_obj_rdma::LogicalMemoryRegistration rdmaRegistration;
     bool rdmaRegistered = false;
 };
 
@@ -156,25 +158,39 @@ DefaultObjEngineImpl::registerMem(const nixlBlobDesc &mem,
         return NIXL_SUCCESS;
     }
 
-    // DRAM_SEG / VRAM_SEG: persistently pin the buffer for RDMA so the client
-    // can mint a token for it. DRAM is best-effort (still usable over HTTP);
-    // VRAM is mandatory (no HTTP path can read a GPU pointer).
+    // DRAM_SEG / VRAM_SEG: persistently pin the buffer when the accelerated
+    // client is active. Non-accelerated DRAM remains usable without backend
+    // metadata; an attempted accelerated registration must succeed atomically.
     bool registered = false;
+    bool registration_attempted = false;
+    nixl_obj_rdma::LogicalMemoryRegistration rdma_registration;
 #ifdef HAVE_CUOBJ_CLIENT
     // Register only when the client's RDMA fast path is fully ready.
     if (s3Client_ && s3Client_->supportsRdma()) {
         if (auto *rdma = nixl_obj_rdma::SharedCuObjClient::instance()) {
-            registered = rdma->registerBuffer(reinterpret_cast<void *>(mem.addr), mem.len);
+            registration_attempted = true;
+            const auto memory_type = nixl_mem == VRAM_SEG
+                                         ? nixl_obj_rdma::RegisteredMemoryType::Vram
+                                         : nixl_obj_rdma::RegisteredMemoryType::Dram;
+            registered = rdma->registerBuffer(
+                reinterpret_cast<void *>(mem.addr), mem.len, memory_type, rdma_registration);
         }
     }
 #endif
+    if (registration_attempted && !registered) {
+        NIXL_ERROR << "Accelerated cuObject memory registration failed";
+        out = nullptr;
+        return NIXL_ERR_BACKEND;
+    }
     if (nixl_mem == VRAM_SEG && !registered) {
         NIXL_ERROR << "VRAM registration requires accelerated=true (generic S3-over-RDMA) and a "
                       "ready RDMA fast path (cuObject)";
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
-    out = registered ? std::make_unique<nixlObjMetadata>(nixl_mem, mem.addr).release() : nullptr;
+    out = registered
+              ? std::make_unique<nixlObjMetadata>(nixl_mem, std::move(rdma_registration)).release()
+              : nullptr;
     return NIXL_SUCCESS;
 }
 
@@ -189,7 +205,10 @@ DefaultObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
 #ifdef HAVE_CUOBJ_CLIENT
         else if (obj_md->rdmaRegistered) {
             if (auto *rdma = nixl_obj_rdma::SharedCuObjClient::instance()) {
-                rdma->deregisterBuffer(reinterpret_cast<void *>(obj_md->localAddr));
+                if (!rdma->deregisterBuffer(obj_md->rdmaRegistration)) {
+                    NIXL_ERROR << "Failed to release one or more cuObject memory descriptors";
+                    return NIXL_ERR_BACKEND;
+                }
             }
         }
 #endif
@@ -348,6 +367,7 @@ DefaultObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
         uintptr_t data_ptr = local_desc.addr;
         size_t data_len = local_desc.len;
         size_t offset = remote_desc.addr;
+        const nixl_mem_t memory_type = local.getType();
 
         iS3Client *client = getClientForSize(data_len);
         if (!client) {
@@ -363,10 +383,20 @@ DefaultObjEngineImpl::postXfer(const nixl_xfer_op_t &operation,
 
         if (operation == NIXL_WRITE) {
             client->putObjectAsync(
-                obj_key_search->second, data_ptr, data_len, offset, status_callback);
+                obj_key_search->second,
+                data_ptr,
+                data_len,
+                offset,
+                memory_type,
+                status_callback);
         } else {
             client->getObjectAsync(
-                obj_key_search->second, data_ptr, data_len, offset, status_callback);
+                obj_key_search->second,
+                data_ptr,
+                data_len,
+                offset,
+                memory_type,
+                status_callback);
         }
     }
 
